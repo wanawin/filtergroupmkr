@@ -516,9 +516,7 @@ def main():
         else:
             md_lines.append("- No high‑risk pairs observed in this bucket.")
         md_lines.append("**Final pool size:** **{}** (target < {})  |  **Winner present:** {}\\n".format(final_remaining, TARGET_MAX+1, '✅ YES' if winner_kept else '❌ NO'))
-        md_text = '\n'.join(md_lines)
-        (OUTPUT_DIR / 'one_pager.md').write_text(md_text, encoding='utf-8')
-
+        (OUTPUT_DIR / 'one_pager.md').write_text('\n'.join(md_lines), encoding='utf-8')
         # --- Build Styled HTML one‑pager (print‑ready) ---
         from datetime import datetime
         generated_at = datetime.now().strftime('%Y-%m-%d %H:%M')
