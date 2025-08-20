@@ -132,6 +132,7 @@ def load_filters(path: str) -> List[FilterDef]:
 # =========================
 # Env builder (matches your app)
 # =========================
+
 def build_env_for_draw(idx: int, winners: List[str]) -> Dict[str, object]:
     seed   = winners[idx-1]
     combo  = winners[idx]
@@ -210,6 +211,7 @@ def build_env_for_draw(idx: int, winners: List[str]) -> Dict[str, object]:
     }
     return env
 
+
 def current_bucket(env: Dict[str, object]) -> Tuple[str,str,str,str]:
     seed_sum_cat = env["seed_sum_category"]
     seed_list = env["seed_digits_list"]
@@ -217,6 +219,7 @@ def current_bucket(env: Dict[str, object]) -> Tuple[str,str,str,str]:
     sb = spread_band(env["spread_seed"])
     parity_major = "even>=3" if sum(1 for d in seed_list if d % 2 == 0) >= 3 else "even<=2"
     return seed_sum_cat, struct, sb, parity_major
+
 
 def safe_eval(expr: str, env: Dict[str, object]) -> bool:
     if not expr:
@@ -230,6 +233,7 @@ def safe_eval(expr: str, env: Dict[str, object]) -> bool:
 # =========================
 # Risk using recent, similar context
 # =========================
+
 def historical_risk_for_applicable(
     filters: List[FilterDef],
     winners: List[str],
@@ -296,6 +300,7 @@ def historical_risk_for_applicable(
 # =========================
 # Core logic
 # =========================
+
 def today_applicable_filters(filters: List[FilterDef], winners: List[str]):
     if len(winners) < 2:
         raise SystemExit("Need at least 2 winners.")
@@ -309,6 +314,7 @@ def today_applicable_filters(filters: List[FilterDef], winners: List[str]):
             app[f.fid] = f
     return idx_now, app, env_now
 
+
 def load_pool(path: str) -> List[str]:
     df = pd.read_csv(path)
     col = "combo" if "combo" in df.columns else ("Result" if "Result" in df.columns else None)
@@ -317,6 +323,7 @@ def load_pool(path: str) -> List[str]:
     vals = df[col].astype(str).str.replace(r"\D","", regex=True).str.zfill(5)
     vals = vals[vals.str.fullmatch(r"\d{5}")]
     return vals.tolist()
+
 
 def apply_filter_to_pool(f: FilterDef, base_env: Dict[str,object], pool: List[str]) -> Tuple[List[str], int]:
     keep, elim = [], 0
@@ -342,6 +349,7 @@ def apply_filter_to_pool(f: FilterDef, base_env: Dict[str,object], pool: List[st
 # =========================
 # Public entry
 # =========================
+
 def main(
     winners_csv: Optional[str] = None,
     filters_csv: Optional[str] = None,
