@@ -10,7 +10,7 @@ import html
 from datetime import datetime
 
 # =========================
-# Defaults (overridden by UI)
+# Defaults (UI can override)
 # =========================
 WINNERS_CSV = "DC5_Midday_Full_Cleaned_Expanded.csv"
 FILTERS_CSV = "lottery_filters_batch_10.csv"
@@ -18,7 +18,6 @@ TODAY_POOL_CSV: Optional[str] = None
 TARGET_MAX = 44
 ALWAYS_KEEP_WINNER = True
 MINIMIZE_BEYOND_TARGET = True
-
 OUTPUT_DIR = Path(".")
 
 # =========================
@@ -47,12 +46,12 @@ def digits_of(s: str) -> List[int]:
 def classify_structure(digs: List[int]) -> str:
     c = Counter(digs)
     counts = sorted(c.values(), reverse=True)
-    if counts == [5]:      return "quint"
-    if counts == [4,1]:    return "quad"
-    if counts == [3,2]:    return "triple_double"
-    if counts == [3,1,1]:  return "triple"
-    if counts == [2,2,1]:  return "double_double"
-    if counts == [2,1,1,1]:return "double"
+    if counts == [5]:       return "quint"
+    if counts == [4,1]:     return "quad"
+    if counts == [3,2]:     return "triple_double"
+    if counts == [3,1,1]:   return "triple"
+    if counts == [2,2,1]:   return "double_double"
+    if counts == [2,1,1,1]: return "double"
     return "single"
 
 def hot_cold_due(history: List[List[int]], k_hotcold: int = 10):
@@ -76,22 +75,6 @@ def hot_cold_due(history: List[List[int]], k_hotcold: int = 10):
 # =========================
 # CSV loaders
 # =========================
-def load_winners(path: str) -> List[str]:
-    df = pd.read_csv(path)
-    col = "Result" if "Result" in df.columns else None
-    if not col:
-        # Try auto-detect: first column with 5-digit numeric strings
-        for c in df.columns:
-            vals = df[c].astype(str).str.replace(r"\D", "", regex=True).str.zfill(5)
-            if (vals.str.fullmatch(r"\d{5}")).all():
-                col = c
-                break
-    if not col:
-        raise ValueError("Winners CSV must contain a 'Result' column of 5-digit combos.")
-    vals = df[col].astype(str).str.replace(r"\D", "", regex=True).str.zfill(5)
-    vals = vals[vals.str.fullmatch(r"\d{5}")]
-    return vals.tolist()
-
 @dataclass(frozen=True)
 class FilterDef:
     fid: str
@@ -99,6 +82,22 @@ class FilterDef:
     enabled: bool
     applicable_if: str
     expression: str
+
+def load_winners(path: str) -> List[str]:
+    df = pd.read_csv(path)
+    # Prefer 'Result', else auto-detect a 5-digit string column
+    col = "Result" if "Result" in df.columns else None
+    if col is None:
+        for c in df.columns:
+            vals = df[c].astype(str).str.replace(r"\D", "", regex=True).str.zfill(5)
+            if (vals.str.fullmatch(r"\d{5}")).all():
+                col = c
+                break
+    if col is None:
+        raise ValueError("Winners CSV must have a 5-digit column (preferably named 'Result').")
+    vals = df[col].astype(str).str.replace(r"\D", "", regex=True).str.zfill(5)
+    vals = vals[vals.str.fullmatch(r"\d{5}")]
+    return vals.tolist()
 
 def load_filters(path: str) -> List[FilterDef]:
     df = pd.read_csv(path)
@@ -115,4 +114,32 @@ def load_filters(path: str) -> List[FilterDef]:
     df["enabled"] = df["enabled"].map(to_bool)
     for col in ["applicable_if","expression"]:
         df[col] = df[col].astype(str).str.strip()
-        df[col] =
+        df[col] = df[col].str.replace('"""','"', regex=False).str.replace("'''","'", regex=False)
+        df[col] = df[col].apply(
+            lambda s: s[1:-1] if len(s)>=2 and s[0]==s[-1] and s[0] in {'"', "'"} else s
+        )
+    out: List[FilterDef] = []
+    for _, r in df.iterrows():
+        out.append(FilterDef(
+            str(r["id"]).strip(),
+            str(r["name"]).strip(),
+            bool(r["enabled"]),
+            str(r["applicable_if"]).strip(),
+            str(r["expression"]).strip(),
+        ))
+    return out
+
+# =========================
+# Env builder (matches your app)
+# =========================
+def build_env_for_draw(idx: int, winners: List[str]) -> Dict[str, object]:
+    seed   = winners[idx-1]
+    combo  = winners[idx]
+    seed_list  = digits_of(seed)
+    combo_list = sorted(digits_of(combo))
+
+    seed_sum = sum(seed_list)
+    combo_sum = sum(combo_list)
+
+    prev_seed = winners[idx-1]
+    prev_prev_seed = winners[idx-2] i
