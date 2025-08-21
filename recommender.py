@@ -1,128 +1,52 @@
-# ---- Helper shims (ensure env builder exists) ----
-from collections import Counter
-from typing import List, Dict, Tuple, Optional
-import itertools as it
+import streamlit as st
+import pandas as pd
+import os
 
-# Try to reuse from profiler if present
+# --- Try to import recommender ---
 try:
-    from profiler import build_env_for_draw, classify_structure, hot_cold_due, sum_category
-    from profiler import MIRROR, VTRAC, digits_of
-except Exception:
-    # Minimal built-ins used by recommender
-    MIRROR = {0:5,1:6,2:7,3:8,4:9,5:0,6:1,7:2,8:3,9:4}
-    VTRAC  = {0:1,5:1,1:2,6:2,2:3,7:3,3:4,8:4,4:5,9:5}
+    from recommender import main as run_recommender
+except ImportError:
+    def run_recommender(**kwargs):
+        st.error("❌ recommender.py is missing — please add it to the repo.")
+        return None
 
-    def digits_of(s: str) -> List[int]:
-        return [int(ch) for ch in str(s) if ch.isdigit()]
+# --- Title ---
+st.title("DCS Recommender — Winner-Preserving")
 
-    def sum_category(total: int) -> str:
-        if 0 <= total <= 15: return "Very Low"
-        if 16 <= total <= 24: return "Low"
-        if 25 <= total <= 33: return "Mid"
-        return "High"
+# --- CSV Inputs ---
+winners_csv = st.text_input("Winners CSV path (in repo)", "DC5_Midday_Full_Cleaned_Expanded.csv")
+filters_csv = st.text_input("Filters CSV path (in repo)", "lottery_filters_batch_10.csv")
 
-    def classify_structure(digs: List[int]) -> str:
-        c = Counter(digs)
-        counts = sorted(c.values(), reverse=True)
-        if counts == [5]:       return "quint"
-        if counts == [4,1]:     return "quad"
-        if counts == [3,2]:     return "triple_double"
-        if counts == [3,1,1]:   return "triple"
-        if counts == [2,2,1]:   return "double_double"
-        if counts == [2,1,1,1]: return "double"
-        return "single"
+# --- Seed inputs with validation ---
+seed = st.text_input("Override seed (5 digits, optional)", max_chars=5, placeholder="#####")
+prev_seed = st.text_input("Override 1-back (optional)", max_chars=5, placeholder="#####")
+prev_prev_seed = st.text_input("Override 2-back (optional)", max_chars=5, placeholder="#####")
+keep_combo = st.text_input("Keep combo (5 digits)", max_chars=5, placeholder="#####")
 
-    def hot_cold_due(history: List[List[int]], k_hotcold: int = 10):
-        flat = [d for row in history[-k_hotcold:] for d in row]
-        cnt = Counter(flat)
-        hot, cold = set(), set()
-        if cnt:
-            most = cnt.most_common()
-            topk = 6
-            thresh = most[topk-1][1] if len(most) >= topk else most[-1][1]
-            hot = {d for d,c in most if c >= thresh}
-            least = sorted(cnt.items(), key=lambda x: (x[1], x[0]))
-            coldk = 4
-            if least:
-                cth = least[coldk-1][1] if len(least) >= coldk else least[0][1]
-                cold = {d for d,c in least if c <= cth}
-        last2 = set(d for row in history[-2:] for d in row)
-        due = set(range(10)) - last2
-        return hot, cold, due
+applicable_ids = st.text_area("Paste Applicable-Only IDs (optional, comma or space separated)")
 
-    def build_env_for_draw(idx: int, winners: List[str]) -> Dict[str, object]:
-        seed   = winners[idx-1]
-        combo  = winners[idx]
-        seed_list  = digits_of(seed)
-        combo_list = sorted(digits_of(combo))
+# --- Run button ---
+if st.button("Run recommender now"):
+    # Validation: ensure 5-digit numeric strings where filled
+    invalids = []
+    for field_name, value in [("Seed", seed), ("Prev seed", prev_seed), ("Prev-prev seed", prev_prev_seed), ("Keep combo", keep_combo)]:
+        if value and (not value.isdigit() or len(value) != 5):
+            invalids.append(f"{field_name}: must be exactly 5 digits")
 
-        seed_sum = sum(seed_list)
-        combo_sum = sum(combo_list)
+    if invalids:
+        st.error("Validation failed:\n" + "\n".join(invalids))
+    else:
+        kwargs = dict(
+            winners_csv=winners_csv,
+            filters_csv=filters_csv,
+            seed=seed or None,
+            prev_seed=prev_seed or None,
+            prev_prev_seed=prev_prev_seed or None,
+            keep_combo=keep_combo or None,
+            applicable_ids=[x.strip() for x in applicable_ids.replace("\n", ",").replace(" ", ",").split(",") if x.strip()]
+        )
 
-        prev_seed = winners[idx-1]
-        prev_prev_seed = winners[idx-2] if idx >= 2 else None
-        prev_seed_digits = digits_of(prev_seed)
-        prev_prev_seed_digits = digits_of(prev_prev_seed) if prev_prev_seed is not None else []
-
-        history_digits = [digits_of(s) for s in winners[:idx]]
-        hot, cold, due = hot_cold_due(history_digits, k_hotcold=10)
-
-        def parity_label(digs): return "Even" if sum(digs) % 2 == 0 else "Odd"
-        prev_pattern = []
-        for digs in (prev_prev_seed_digits, prev_seed_digits, seed_list):
-            prev_pattern.extend([sum_category(sum(digs)), parity_label(digs)])
-        prev_pattern = tuple(prev_pattern)
-
-        env = {
-            "combo": combo,
-            "combo_digits": set(combo_list),
-            "combo_digits_list": combo_list,
-            "combo_sum": combo_sum,
-            "combo_sum_cat": sum_category(combo_sum),
-            "combo_sum_category": sum_category(combo_sum),
-
-            "seed": seed,
-            "seed_digits": set(seed_list),
-            "seed_digits_list": seed_list,
-            "seed_sum": seed_sum,
-            "prev_sum_cat": sum_category(seed_sum),
-            "seed_sum_category": sum_category(seed_sum),
-
-            "spread_seed": max(seed_list) - min(seed_list) if seed_list else 0,
-            "spread_combo": max(combo_list) - min(combo_list) if combo_list else 0,
-
-            "seed_vtracs": set(VTRAC[d] for d in seed_list),
-            "combo_vtracs": set(VTRAC[d] for d in combo_list),
-
-            "last2": set(seed_list) | set(prev_seed_digits),
-
-            "prev_seed": prev_seed,
-            "prev_seed_digits": prev_seed_digits,
-            "prev_seed_digits_list": prev_seed_digits,
-            "prev_prev_seed": prev_prev_seed,
-            "prev_prev_seed_digits": prev_prev_seed_digits,
-            "prev_prev_seed_digits_list": prev_prev_seed_digits,
-            "prev_pattern": prev_pattern,
-
-            "new_seed_digits": set(seed_list) - set(prev_seed_digits),
-            "seed_counts": Counter(seed_list),
-            "common_to_both": set(seed_list) & set(prev_seed_digits),
-
-            "hot_digits_10": hot,
-            "cold_digits_10": cold,
-            "hot_digits_20": hot,
-            "cold_digits_20": cold,
-            "hot_digits": sorted(hot),
-            "cold_digits": sorted(cold),
-            "due_digits": sorted(due),
-            "due_digits_2": due,
-
-            "mirror": MIRROR,
-            "vtrac": VTRAC,
-
-            # safe builtins
-            "any": any, "all": all, "len": len, "sum": sum,
-            "max": max, "min": min, "set": set, "sorted": sorted, "Counter": Counter,
-        }
-        return env
-# ---- end helper shims ----
+        result = run_recommender(**kwargs)
+        if result is not None:
+            st.success("✅ Recommender finished")
+            st.dataframe(pd.DataFrame(result))
