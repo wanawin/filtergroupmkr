@@ -2,6 +2,9 @@ import streamlit as st
 import pandas as pd
 from pathlib import Path
 
+# Import recommender entrypoint
+from recommender import main as run_recommender
+
 # ========================
 # Paths (repo-root relative)
 # ========================
