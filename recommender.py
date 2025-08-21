@@ -1,4 +1,4 @@
-h# recommender.py (historical trainer + by-case recommender)
+# recommender.py (historical trainer + by-case recommender)
 # Updated with case-by-case failure tracking, richer signatures, neighbor fallback, and aggressiveness ranking.
 
 from __future__ import annotations
@@ -291,6 +291,7 @@ def main(
 
     # Optional overrides to align with UI typing
     if override_seed:
+        # Explicit seed triplet lets the app build the exact case for TODAY
         seed = str(override_seed).strip().zfill(5)
         prev = (override_prev or winners[-1]).strip().zfill(5)
         prevprev = (override_prevprev or winners[-2]).strip().zfill(5)
@@ -327,30 +328,27 @@ def main(
     support_threshold = 6
     exact = stats[stats['sig_key'] == sig_key]
     if not exact.empty:
-        # use exact when we have decent support
         exact_ok = exact[exact['n_app'] >= support_threshold]
         if not exact_ok.empty:
             case_rates = {r['filter_id']: float(r['fail_rate']) for _, r in exact_ok.iterrows()}
     if not case_rates:
-        # neighbor fallback
-        case_rates = _neighbor_fail_rates(sig_key, applicable_ids_today, stats, hist, k=12, min_sim=0.35)
+        # neighbor fallback (more permissive to avoid defaulting)
+        case_rates = _neighbor_fail_rates(sig_key, applicable_ids_today, stats, hist, k=25, min_sim=0.10)
 
     # Pair risk by case (exact or neighbor keys)
     neighbor_keys = []
     if not exact.empty:
         neighbor_keys = [sig_key]
     else:
-        # choose neighbor keys from hist
         uniq = hist[['sig_key','applicable']].drop_duplicates()
         uniq['app_set'] = uniq['applicable'].fillna('').apply(lambda s: set([t for t in str(s).split(',') if t]))
         A = set(applicable_ids_today)
         uniq['sim'] = uniq['app_set'].apply(lambda B: (len(A & B)/max(1,len(A|B))) if (A or B) else 1.0)
-        neighbor_keys = uniq.sort_values('sim', ascending=False).head(12)['sig_key'].tolist()
+        neighbor_keys = uniq.sort_values('sim', ascending=False).head(25)['sig_key'].tolist()
     pair_case = _pair_risk_by_case(applicable_ids_today, hist, neighbor_keys)
 
-    # Rank filters by (risk then expected reduction)
-    base_env = env_now
-    seq_rows = []
+    # Winner-agnostic safety mode: if caller wants to preserve winner but we DON'T know it,
+    # skip filters whose case-failure is high rather than risking removal of the unknown winner.
     winner_today = None
     if force_keep_combo:
         winner_today = str(force_keep_combo).strip().replace(" ", "")
@@ -358,18 +356,22 @@ def main(
         wt = winners[idx_now]
         winner_today = wt if isinstance(wt,str) and wt.isdigit() else None
 
-    remaining = len(pool)
+    agnostic_preserve = bool(always_keep_winner and not winner_today)
+    risk_skip_threshold = 0.25  # skip filters with >=25% case fail rate when winner is unknown
 
-    # initial order using risk; missing rates default high (0.5)
-    def risk_of(fid):
+    def risk_of(fid: str) -> float:
         return float(case_rates.get(fid, 0.5))
 
+    # Rank by risk first; ties by ID (expected reduction will be captured during actual application)
     ranked = sorted(todays_app.values(), key=lambda f: (risk_of(f.fid), f.fid))
+
+    base_env = env_now
+    seq_rows = []
+    remaining = len(pool)
 
     for step, f in enumerate(ranked, start=1):
         fid = f.fid
         est_risk = round(risk_of(fid), 6)
-        # case pair conflicts list
         conflicts = []
         for other in applicable_ids_today:
             if other == fid: continue
@@ -377,6 +379,16 @@ def main(
             if pr > 0:
                 conflicts.append(other)
         conflicts_str = ",".join(sorted(conflicts))
+
+        # Winner-agnostic guard: skip high-risk filters when we don't know the winner
+        if agnostic_preserve and est_risk >= risk_skip_threshold:
+            seq_rows.append({
+                "step": step, "filter_id": fid, "name": f.name,
+                "est_risk": est_risk, "est_pair_conflicts": conflicts_str,
+                "eliminated_now": 0, "remaining": remaining,
+                "skipped_reason": "risk_skip"
+            })
+            continue
 
         if pool:
             new_pool, elim = apply_filter_to_pool(f, base_env, pool)
@@ -421,6 +433,7 @@ def main(
     for (a,b), pr in sorted(pair_case.items(), key=lambda kv: (-kv[1], kv[0])):
         avoid_rows.append({"filter_id_1": a, "filter_id_2": b, "pair_risk": round(float(pr),6)})
     pd.DataFrame(avoid_rows).to_csv(OUTPUT_DIR/"avoid_by_case.csv", index=False)
+
 
 
 if __name__ == "__main__":
