@@ -149,6 +149,7 @@ with st.expander("Step 2 · Run Recommender", expanded=True):
                     applicable_only=applicable_only.strip() or None,
                     train_mode=False,
                 )
+                from recommender import main as run_recommender
                 run_recommender(**kwargs)
                 st.success("Recommender finished.")
             except Exception as e:
