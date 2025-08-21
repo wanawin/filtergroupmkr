@@ -1,3 +1,9 @@
+try:
+    pass
+except Exception as _boot_err:  # this will be replaced when the file executes
+    import streamlit as st
+    st.exception(_boot_err)
+    st.stop()
 # streamlined_streamlit_app.py
 # One-screen Streamlit UI that:
 #  1) Shows when the case tables were last refreshed (and basic meta)
