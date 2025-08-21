@@ -437,9 +437,10 @@ def main(
                     "both_blocked_n": both_blk,
                     "pair_risk": round(both_blk / max(co_app, 1), 6)
                 })
-    pd.DataFrame(avoid_rows).sort_values(
-        ["pair_risk","co_applicable_n"], ascending=[False,False]
-    ).to_csv(OUTPUT_DIR / "avoid_pairs.csv", index=False)
+    avoid_df = pd.DataFrame(avoid_rows)
+    if not avoid_df.empty:
+        avoid_df = avoid_df.sort_values(["pair_risk","co_applicable_n"], ascending=[False,False])
+    avoid_df.to_csv(OUTPUT_DIR / "avoid_pairs.csv", index=False)
 
     # ---- Build DO NOT APPLY / APPLY LATE / SAFE lists for today's applicable set
     rows = []
