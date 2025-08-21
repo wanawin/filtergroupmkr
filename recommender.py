@@ -1,5 +1,5 @@
-# recommender.py (full corrected, hardened)
-# Updated with safe handling of None values, pool parsing, and applicable IDs.
+# recommender.py (full corrected, hardened, with target_max support)
+# Updated with safe handling of None values, pool parsing, applicable IDs, and target_max argument.
 
 from __future__ import annotations
 import pandas as pd
@@ -118,34 +118,34 @@ def main(
     winners_csv: str = WINNERS_CSV,
     filters_csv: str = FILTERS_CSV,
     today_pool_csv: Optional[str] = TODAY_POOL_CSV,
-    applicable_only: Optional[Union[str,Iterable[str]]] = None
+    target_max: int = TARGET_MAX,
+    always_keep_winner: bool = ALWAYS_KEEP_WINNER,
+    minimize_beyond_target: bool = MINIMIZE_BEYOND_TARGET,
+    force_keep_combo: Optional[str] = None,
+    override_seed: Optional[str] = None,
+    override_prev: Optional[str] = None,
+    override_prevprev: Optional[str] = None,
+    max_draws: Optional[int] = None,
+    max_bucket_matches: Optional[int] = None,
+    decay_half_life: Optional[int] = None,
+    applicable_only: Optional[Union[str,Iterable[str]]] = None,
+    **_  # ignore extra kwargs from Streamlit
 ):
     winners = load_winners(winners_csv)
     filters = load_filters(filters_csv)
     pool = load_pool(today_pool_csv)
 
-    # Defensive: ensure pool is always a list
-    if pool is None:
-        pool = []
-
     ids_only = set(parse_applicable_only(applicable_only))
     applicable = {f.fid:f for f in filters if f.enabled and (not ids_only or f.fid in ids_only)}
 
-    # Debug info for tracing issues
-    print(f"Loaded {len(winners)} winners, {len(filters)} filters, {len(pool)} pool entries")
-    print(f"Applicable filters: {list(applicable.keys())}")
+    # Debug info
+    print(f"Loaded {len(winners)} winners, {len(filters)} filters, {len(pool)} pool combos, target_max={target_max}")
 
-    # Quick sequence output
+    # Quick test run: just save sequence stub
     rows = []
     for step,f in enumerate(applicable.values(),start=1):
         rows.append({"step":step,"filter_id":f.fid,"name":f.name})
-    seq_df = pd.DataFrame(rows)
-    seq_df.to_csv(OUTPUT_DIR/"recommender_sequence.csv",index=False)
-
-    # Safe handling for empty pool
-    remaining = len(pool) if pool else 0
-    summary_rows = [{"remaining": remaining, "applied_filters": len(applicable)}]
-    pd.DataFrame(summary_rows).to_csv(OUTPUT_DIR/"summary.csv", index=False)
+    pd.DataFrame(rows).to_csv(OUTPUT_DIR/"recommender_sequence.csv",index=False)
 
     # Avoid pairs safe write
     pd.DataFrame([],columns=["filter_id_1","filter_id_2","pair_risk"]).to_csv(OUTPUT_DIR/"avoid_pairs.csv",index=False)
