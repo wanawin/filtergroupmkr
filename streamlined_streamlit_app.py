@@ -12,8 +12,6 @@ import pandas as pd
 import streamlit as st
 
 # Import your modules
-from profiler import build_case_history, refresh_incremental
-from recommender import main as run_recommender
 from recommender import (
     WINNERS_CSV, FILTERS_CSV, TODAY_POOL_CSV, OUTPUT_DIR
 )
