@@ -3,7 +3,7 @@ from __future__ import annotations
 import pandas as pd
 from dataclasses import dataclass
 from collections import Counter
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Iterable, Union
 from pathlib import Path
 import itertools as it
 import html
@@ -16,7 +16,7 @@ FILTERS_CSV = "lottery_filters_batch_10.csv"
 TODAY_POOL_CSV: Optional[str] = None
 TARGET_MAX = 44
 ALWAYS_KEEP_WINNER = True
-MINIMIZE_BEYOND_TARGET = True
+MINIMIZE_BEYOND_TARGET = TRUE = True  # alias kept for back-compat
 OUTPUT_DIR = Path(".")
 
 # =========================
@@ -198,7 +198,6 @@ def build_env_for_draw(idx: int, winners: List[str]) -> Dict[str, object]:
         "hot_digits": sorted(hot),
         "cold_digits": sorted(cold),
         "due_digits": sorted(due),
-        "due_digits_2": due,
 
         "mirror": MIRROR,
         "vtrac": VTRAC,
@@ -225,6 +224,32 @@ def safe_eval(expr: str, env: Dict[str, object]) -> bool:
     except Exception:
         # treat errors as not-applicable / not-eliminating
         return False
+
+# -------------------------
+# Utility: robust ID parser
+# -------------------------
+def parse_applicable_only(val: Optional[Union[str, Iterable[str]]]) -> List[str]:
+    if val is None:
+        return []
+    # Some UIs pass a float NaN; treat as empty
+    try:
+        import math
+        if isinstance(val, float) and math.isnan(val):
+            return []
+    except Exception:
+        pass
+    if isinstance(val, str):
+        chunks = []
+        for token in val.replace("\n", " ").replace("\t", " ").split(","):
+            for sub in token.split():
+                s = sub.strip()
+                if s:
+                    chunks.append(s)
+        return chunks
+    try:
+        return [str(x).strip() for x in val if str(x).strip()]
+    except Exception:
+        return []
 
 # =========================
 # Risk using recent, similar context
@@ -347,53 +372,54 @@ def main(
     today_pool_csv: Optional[str] = None,
     target_max: int = TARGET_MAX,
     always_keep_winner: bool = ALWAYS_KEEP_WINNER,
-    minimize_beyond_target: bool = MINIMIZE_BEYOND_TARGET,
-    force_keep_combo: Optional[str] = None,       # NEW
-    override_seed: Optional[str] = None,          # NEW
-    override_prev: Optional[str] = None,          # NEW
-    override_prevprev: Optional[str] = None,      # NEW
-    max_draws: Optional[int] = None,              # NEW
-    max_bucket_matches: Optional[int] = None,     # NEW
-    decay_half_life: Optional[int] = None,        # NEW
-    applicable_only: Optional[List[str]] = None,  # NEW - IDs pasted from main app
+    minimize_beyond_target: bool = TRUE,  # keep existing default
+    force_keep_combo: Optional[str] = None,
+    override_seed: Optional[str] = None,
+    override_prev: Optional[str] = None,
+    override_prevprev: Optional[str] = None,
+    max_draws: Optional[int] = None,
+    max_bucket_matches: Optional[int] = None,
+    decay_half_life: Optional[int] = None,
+    applicable_only: Optional[Union[str, Iterable[str]]] = None,
 ):
-    # Resolve inputs (allow override)
-    winners_path = winners_csv or WINNERS_CSV
-    filters_path = filters_csv or FILTERS_CSV
+    # Resolve inputs (allow override) and normalize empties -> None
+    winners_path = (winners_csv or WINNERS_CSV or "").strip() or None
+    filters_path = (filters_csv or FILTERS_CSV or "").strip() or None
+    pool_path    = (today_pool_csv or TODAY_POOL_CSV or "").strip() or None
 
     # Friendly existence check
     present = ", ".join(sorted(p.name for p in Path(".").glob("*.csv")))
-    if not Path(winners_path).exists():
-        raise FileNotFoundError(f"Missing {winners_path}. CSVs here: {present}")
-    if not Path(filters_path).exists():
-        raise FileNotFoundError(f"Missing {filters_path}. CSVs here: {present}")
+    if not winners_path or not Path(winners_path).exists():
+        raise FileNotFoundError(f"Missing {winners_path or '<winners_csv>'}. CSVs here: {present}")
+    if not filters_path or not Path(filters_path).exists():
+        raise FileNotFoundError(f"Missing {filters_path or '<filters_csv>'}. CSVs here: {present}")
 
     winners = load_winners(winners_path)
     filters = load_filters(filters_path)
 
-    # ---- Optional: override today's seed/prevs to match what you typed in the main app
+    # Optional: override today's seed/prevs
     if override_seed:
         seed = str(override_seed).strip().zfill(5)
         prev = (override_prev or winners[-1]).strip().zfill(5)
         prevprev = (override_prevprev or winners[-2]).strip().zfill(5)
-        winners = winners[:-2] + [prevprev, prev, seed, "00000"]  # last is dummy "today"
+        winners = winners[:-2] + [prevprev, prev, seed, "00000"]  # dummy last "today"
 
     # Compute applicable for "today"
     idx_now, applicable, env_now = today_applicable_filters(filters, winners)
 
-    # Restrict to "applicable only" list if provided
-    if applicable_only:
-        applicable_only = {fid.strip() for fid in applicable_only}
-        applicable = {fid: f for fid, f in applicable.items() if fid in applicable_only}
+    # Normalize applicable_only (string/list/None)
+    ids_only = set(parse_applicable_only(applicable_only))
+    if ids_only:
+        applicable = {fid: f for fid, f in applicable.items() if fid in ids_only}
 
-    # Historical risks with recency controls
+    # Historical risks
     single_fail, pair_risk, idx_used = historical_risk_for_applicable(
         list(applicable.values()), winners, idx_now,
         max_draws=max_draws, max_bucket_matches=max_bucket_matches,
         decay_half_life=decay_half_life
     )
 
-    # Support counts computed over the same indices we used for risk
+    # Support counts computed over same indices
     support = {fid: 0 for fid in applicable}
     for i in idx_used:
         env_i = build_env_for_draw(i, winners)
@@ -401,10 +427,10 @@ def main(
             if safe_eval(f.applicable_if, env_i):
                 support[fid] = support.get(fid, 0) + 1
 
-    # Rank applicable by safety (lower risk, higher support)
+    # Rank applicable by safety
     ranked = sorted(applicable.values(), key=lambda f: (single_fail.get(f.fid, 1.0), -support.get(f.fid,0), f.fid))
 
-    # Pair conflicts for applicable (simple frequency) — SAFE FOR EMPTY
+    # Pair conflicts — SAFE WHEN EMPTY
     avoid_rows = []
     for a, b in it.combinations(sorted(applicable.keys()), 2):
         pr = pair_risk.get((a,b)) or pair_risk.get((b,a)) or 0.0
@@ -432,7 +458,7 @@ def main(
         avoid_df = avoid_df.sort_values(["pair_risk","co_applicable_n"], ascending=[False,False])
     avoid_df.to_csv(OUTPUT_DIR / "avoid_pairs.csv", index=False)
 
-    # ---- Build DO NOT APPLY / APPLY LATE / SAFE lists for today's applicable set
+    # ---- DO_NOT_APPLY / APPLY_LATE / SAFE lists
     rows = []
     for fid, f in applicable.items():
         risk = float(single_fail.get(fid, 0.0))
@@ -458,15 +484,16 @@ def main(
     # Reduction (optional if pool provided)
     seq_rows = []
     base_env = env_now
-    pool = load_pool(today_pool_csv) if today_pool_csv else None
-    remaining = len(pool) if pool is not None else 0  # avoid len(None)
+    pool = load_pool(pool_path) if pool_path else None
+    remaining = len(pool) if isinstance(pool, list) else 0  # NEVER len(None)
 
-    # pick the "keep" combo: forced, else last real winner, else none
+    # pick the "keep" combo
     winner_today = None
     if force_keep_combo:
         winner_today = str(force_keep_combo).strip().replace(" ", "")
     elif pool is not None:
-        winner_today = (winners[idx_now] if str(winners[idx_now]).isdigit() else None)
+        wt = winners[idx_now]
+        winner_today = wt if isinstance(wt, str) and wt.isdigit() else None
 
     for step, f in enumerate(ranked, start=1):
         fid = f.fid
@@ -523,13 +550,13 @@ def main(
             })
 
     pd.DataFrame(seq_rows).to_csv(OUTPUT_DIR / "recommender_sequence.csv", index=False)
-    if today_pool_csv:
+    if pool_path:
         pd.DataFrame([r for r in seq_rows if r["eliminated_now"] not in (None,0)]).to_csv(
             OUTPUT_DIR / "pool_reduction_log.csv", index=False
         )
 
     # ======== One-pager (Markdown) ========
-    if today_pool_csv:
+    if pool_path:
         seed_list = base_env['seed_digits_list']
         parity_major = "even>=3" if sum(1 for d in seed_list if d%2==0) >= 3 else "even<=2"
         applied_steps = [r for r in seq_rows if r['eliminated_now'] not in (None,0)]
@@ -632,15 +659,18 @@ h2 { font-size: 18px; margin: 24px 0 8px; }
         def df_to_html_table(df: pd.DataFrame, columns: list, empty_msg: str, limit: int = None):
             if df is None or df.empty:
                 return "<p class='muted'>{}</p>".format(html.escape(empty_msg))
-            use = df[columns].copy()
+            use = df.copy()
+            # create missing columns if DF is empty/partial
+            for c in columns:
+                if c not in use.columns:
+                    use[c] = []
+            use = use[columns]
             if limit:
                 use = use.head(limit)
             return use.to_html(index=False, classes="table", border=0, escape=True)
 
         applied_steps = [r for r in seq_rows if r['eliminated_now'] not in (None,0)]
         skipped_steps = [r for r in seq_rows if r.get('skipped_reason')]
-        avoid_path = OUTPUT_DIR / "avoid_pairs.csv"
-        avoid_df2 = pd.read_csv(avoid_path) if Path(avoid_path).exists() else pd.DataFrame()
         avoid_sorted = avoid_df2.sort_values(["pair_risk","co_applicable_n"], ascending=[False,False]) if not avoid_df2.empty else avoid_df2
 
         applied_html = df_to_html_table(pd.DataFrame(applied_steps),
