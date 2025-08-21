@@ -1,39 +1,13 @@
 # recommender.py
 from __future__ import annotations
 
-"""
-DCS Recommender — winner-preserving (robust, no external case_stats required)
-
-What this version does:
-- Loads winners & filters from CSV.
-- (Optionally) overrides seed / prev / prev-prev for "today".
-- Builds the "applicable today" set by evaluating each filter's applicable_if.
-- Computes historical risk *from your winners file itself* (NOT from case_filter_stats.csv),
-  using the same bucket/recency controls as before.
-- Ranks applicable filters by (lower risk, higher support, ID).
-- (Optionally) reduces a provided pool CSV in that order, while preserving the winner/keep combo.
-- Writes the same output CSVs as your earlier app:
-    - avoid_pairs.csv
-    - do_not_apply.csv
-    - recommender_sequence.csv
-    - pool_reduction_log.csv (only if pool provided)
-    - one_pager.md / one_pager.html (only if pool provided)
-- Returns a Python list of rows (the reduction sequence) for Streamlit to display.
-
-Safe changes from earlier versions:
-- No import of WINNERS_CSV / FILTERS_CSV constants by Streamlit; you pass paths in.
-- No dependence on case_filter_stats.csv or a "failure_rate" column.
-- Handles empty/None "applicable IDs" cleanly.
-"""
-
-import itertools as it
+import pandas as pd
 from dataclasses import dataclass
 from collections import Counter
-from pathlib import Path
 from typing import Dict, List, Tuple, Optional
+from pathlib import Path
+import itertools as it
 import html
-
-import pandas as pd
 
 # =========================
 # Defaults (UI can override)
@@ -254,7 +228,7 @@ def safe_eval(expr: str, env: Dict[str, object]) -> bool:
         return False
 
 # =========================
-# Risk using recent, similar context (from winners only)
+# Risk (using only history – no external tables)
 # =========================
 def historical_risk_for_applicable(
     filters: List[FilterDef],
@@ -265,8 +239,12 @@ def historical_risk_for_applicable(
     decay_half_life: Optional[int] = None,
 ):
     """
-    Estimate per-filter 'failure rate' purely from history in winners.csv.
-    This version does NOT require external case_filter_stats.csv.
+    Computes single-filter failure rates and pair co-failure rates
+    *within the same bucket* as today, using only historical draws.
+
+    max_draws: last N draws overall (0/None = all)
+    max_bucket_matches: last K occurrences of this bucket (0/None = all)
+    decay_half_life: exponential decay (in draws); None/0 = no weighting
     """
     env_now = build_env_for_draw(idx_now, winners)
     bucket = current_bucket(env_now)
@@ -317,6 +295,23 @@ def historical_risk_for_applicable(
 
     # also return the list of indices used, so we can compute "support" consistently
     return single_failure_rate, pair_risk, candidate_indices
+
+# =========================
+# Case-table shim (never crashes if tables are absent)
+# =========================
+def _risk_for_filter_ids(stats: Optional[pd.DataFrame], filter_ids):
+    """
+    Backward-compatible shim:
+    - If a historical stats table is present and has 'failure_rate', use it.
+    - Otherwise, return 0.0 risk for all IDs so the app still runs.
+    """
+    if stats is None or not isinstance(stats, pd.DataFrame):
+        return {fid: 0.0 for fid in filter_ids}
+    if "failure_rate" not in stats.columns or "filter_id" not in stats.columns:
+        return {fid: 0.0 for fid in filter_ids}
+    g = stats.groupby("filter_id", as_index=False)["failure_rate"].mean()
+    m = dict(zip(g["filter_id"].astype(str), g["failure_rate"].astype(float)))
+    return {fid: float(m.get(str(fid), 0.0)) for fid in filter_ids}
 
 # =========================
 # Core logic
@@ -374,15 +369,14 @@ def main(
     target_max: int = TARGET_MAX,
     always_keep_winner: bool = ALWAYS_KEEP_WINNER,
     minimize_beyond_target: bool = MINIMIZE_BEYOND_TARGET,
-    force_keep_combo: Optional[str] = None,       # optional keep combo
-    override_seed: Optional[str] = None,
-    override_prev: Optional[str] = None,
-    override_prevprev: Optional[str] = None,
-    max_draws: Optional[int] = None,
-    max_bucket_matches: Optional[int] = None,
-    decay_half_life: Optional[int] = None,
-    applicable_only: Optional[List[str]] = None,  # IDs pasted from main app
-    **_kwargs,                                     # allow extra kwargs from Streamlit
+    force_keep_combo: Optional[str] = None,       # optional
+    override_seed: Optional[str] = None,          # optional
+    override_prev: Optional[str] = None,          # optional
+    override_prevprev: Optional[str] = None,      # optional
+    max_draws: Optional[int] = None,              # optional
+    max_bucket_matches: Optional[int] = None,     # optional
+    decay_half_life: Optional[int] = None,        # optional
+    applicable_only: Optional[List[str]] = None,  # optional - IDs pasted from UI
 ):
     # Resolve inputs (allow override)
     winners_path = winners_csv or WINNERS_CSV
@@ -401,9 +395,8 @@ def main(
     # ---- Optional: override today's seed/prevs to match what you typed in the main app
     if override_seed:
         seed = str(override_seed).strip().zfill(5)
-        prev = (override_prev or winners[-1]).strip().zfill(5) if override_prev else winners[-1]
-        prevprev = (override_prevprev or winners[-2]).strip().zfill(5) if override_prevprev else winners[-2]
-        # replace last two real draws with the overridden prev/prevprev, plus today's seed and dummy
+        prev = (override_prev or winners[-1]).strip().zfill(5)
+        prevprev = (override_prevprev or winners[-2]).strip().zfill(5)
         winners = winners[:-2] + [prevprev, prev, seed, "00000"]  # last is dummy "today"
 
     # Compute applicable for "today"
@@ -411,10 +404,10 @@ def main(
 
     # Restrict to "applicable only" list if provided
     if applicable_only:
-        allow = {fid.strip() for fid in applicable_only if fid and str(fid).strip()}
-        applicable = {fid: f for fid, f in applicable.items() if fid in allow}
+        applicable_only = {fid.strip() for fid in applicable_only}
+        applicable = {fid: f for fid, f in applicable.items() if fid in applicable_only}
 
-    # Historical risks with recency controls (purely from winners)
+    # Historical risks with recency controls (no external tables)
     single_fail, pair_risk, idx_used = historical_risk_for_applicable(
         list(applicable.values()), winners, idx_now,
         max_draws=max_draws, max_bucket_matches=max_bucket_matches,
@@ -430,7 +423,7 @@ def main(
                 support[fid] = support.get(fid, 0) + 1
 
     # Rank applicable by safety (lower risk, higher support)
-    ranked = sorted(applicable.values(), key=lambda f: (float(single_fail.get(f.fid, 0.0)), -int(support.get(f.fid,0)), f.fid))
+    ranked = sorted(applicable.values(), key=lambda f: (single_fail.get(f.fid, 1.0), -support.get(f.fid,0), f.fid))
 
     # Pair conflicts for applicable (simple frequency)
     avoid_rows = []
@@ -497,7 +490,7 @@ def main(
 
     for step, f in enumerate(ranked, start=1):
         fid = f.fid
-        est_risk = round(float(single_fail.get(fid, 0.0)), 6)
+        est_risk = round(single_fail.get(fid, 1.0), 6)
         conflicts = []
         for other in applicable:
             if other == fid:
@@ -512,7 +505,7 @@ def main(
             if always_keep_winner and winner_today and (winner_today not in new_pool):
                 seq_rows.append({
                     "step": step, "filter_id": fid, "name": f.name,
-                    "est_risk": est_risk, "est_support": int(support.get(fid, 0)),
+                    "est_risk": est_risk, "est_support": support.get(fid, 0),
                     "est_pair_conflicts": conflicts_str,
                     "eliminated_now": 0, "remaining": remaining,
                     "skipped_reason": "would_remove_winner"
@@ -521,7 +514,7 @@ def main(
             if elim == 0:
                 seq_rows.append({
                     "step": step, "filter_id": fid, "name": f.name,
-                    "est_risk": est_risk, "est_support": int(support.get(fid, 0)),
+                    "est_risk": est_risk, "est_support": support.get(fid, 0),
                     "est_pair_conflicts": conflicts_str,
                     "eliminated_now": 0, "remaining": remaining,
                     "skipped_reason": "no_reduction"
@@ -532,7 +525,7 @@ def main(
             remaining = len(pool)
             seq_rows.append({
                 "step": step, "filter_id": fid, "name": f.name,
-                "est_risk": est_risk, "est_support": int(support.get(fid, 0)),
+                "est_risk": est_risk, "est_support": support.get(fid, 0),
                 "est_pair_conflicts": conflicts_str,
                 "eliminated_now": elim, "remaining": remaining,
                 "skipped_reason": None
@@ -543,7 +536,7 @@ def main(
             # record ordering only
             seq_rows.append({
                 "step": step, "filter_id": fid, "name": f.name,
-                "est_risk": est_risk, "est_support": int(support.get(fid, 0)),
+                "est_risk": est_risk, "est_support": support.get(fid, 0),
                 "est_pair_conflicts": conflicts_str,
                 "eliminated_now": None, "remaining": None,
                 "skipped_reason": None
@@ -555,7 +548,7 @@ def main(
             OUTPUT_DIR / "pool_reduction_log.csv", index=False
         )
 
-    # ======== One-pager (Markdown & HTML) if pool ========
+    # ======== One-pager (Markdown) ========
     if today_pool_csv:
         seed_list = base_env['seed_digits_list']
         parity_major = "even>=3" if sum(1 for d in seed_list if d%2==0) >= 3 else "even<=2"
@@ -596,7 +589,8 @@ def main(
         if not avoid_df.empty:
             for _, row in avoid_df.head(12).iterrows():
                 md_lines.append("- **{} + {}**  · pair_risk={}  (both_blocked/CoApp={}/{})".format(
-                    row['filter_id_1'], row['filter_id_2'], row['pair_risk'], row['both_blocked_n'], row['co_applicable_n']
+                    row['filter_id_1'], row['filter_id_2'], row['pair_risk'],
+                    row['both_blocked_n'], row['co_applicable_n']
                 ))
         else:
             md_lines.append("- No high-risk pairs observed in this bucket.")
@@ -605,12 +599,12 @@ def main(
         ))
         (OUTPUT_DIR / "one_pager.md").write_text("\n".join(md_lines), encoding="utf-8")
 
-        # HTML one-pager
+        # ======== One-pager (HTML) ========
         HTML_CSS = """<!doctype html><html lang='en'><head><meta charset='utf-8'>
 <title>DC5 Recommender — One-Pager</title>
 <style>
 :root { --fg:#0f172a; --muted:#64748b; --bg:#fff; }
-body { margin:0; font:14px/1.5 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Inter, Helvetica, Arial; color:var(--fg); background:var(--bg);}
+body { margin:0; font:14px/1.5 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Inter, Helvetica, Arial; color:var(--fg); background:var(--bg); }
 .wrap { max-width: 900px; margin: 28px auto 64px; padding: 0 20px; }
 h1 { font-size: 24px; margin: 0 0 8px; }
 h2 { font-size: 18px; margin: 24px 0 8px; }
@@ -623,6 +617,7 @@ h2 { font-size: 18px; margin: 24px 0 8px; }
 .badge.ok { background:#ecfdf5; }
 .badge.bad { background:#fef2f2; }
 </style></head><body><div class='wrap'>"""
+        seed_list = base_env['seed_digits_list']
         parity_major = "even>=3" if sum(1 for d in seed_list if d%2==0) >= 3 else "even<=2"
         winner_kept = (winner_today in pool) if pool is not None else True
         snap = (
@@ -687,9 +682,16 @@ h2 { font-size: 18px; margin: 24px 0 8px; }
 
         (OUTPUT_DIR / "one_pager.html").write_text(html_doc, encoding="utf-8")
 
-    # Return a compact table for Streamlit
+    # Return something lightweight for Streamlit tables
     return seq_rows
 
+
+# Make module symbols explicit for Streamlit “from recommender import …”
+__all__ = [
+    "WINNERS_CSV", "FILTERS_CSV", "TODAY_POOL_CSV", "OUTPUT_DIR",
+    "TARGET_MAX", "ALWAYS_KEEP_WINNER", "MINIMIZE_BEYOND_TARGET",
+    "main"
+]
 
 if __name__ == "__main__":
     main()
