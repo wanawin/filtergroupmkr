@@ -13,8 +13,6 @@ CASE_STATS      = "case_filter_stats.csv"
 OUT_DIR         = Path(".")
 
 st.set_page_config(page_title="DCS Recommender — Streamlined", layout="wide")
-st.title("DCS Recommender — Winner-Preserving")
-
 # ---------- helpers ----------
 
 def _fmt_dt(path: Path) -> str:
