@@ -459,14 +459,14 @@ def main(
     seq_rows = []
     base_env = env_now
     pool = load_pool(today_pool_csv) if today_pool_csv else None
-    remaining = len(pool) if pool else None
+    remaining = len(pool) if pool is not None else 0  # avoid len(None)
 
     # pick the "keep" combo: forced, else last real winner, else none
     winner_today = None
     if force_keep_combo:
         winner_today = str(force_keep_combo).strip().replace(" ", "")
     elif pool is not None:
-        winner_today = (winners[idx_now] if winners[idx_now].isdigit() else None)
+        winner_today = (winners[idx_now] if str(winners[idx_now]).isdigit() else None)
 
     for step, f in enumerate(ranked, start=1):
         fid = f.fid
@@ -565,7 +565,7 @@ def main(
                 md_lines.append("- **{}** — {}  ({})".format(r['filter_id'], r['name'], r['skipped_reason']))
         md_lines.append("\n## Avoid combining (today’s bucket)\n")
         avoid_path = OUTPUT_DIR / "avoid_pairs.csv"
-        avoid_df2 = pd.read_csv(avoid_path) if avoid_path.exists() else pd.DataFrame()
+        avoid_df2 = pd.read_csv(avoid_path) if Path(avoid_path).exists() else pd.DataFrame()
         if not avoid_df2.empty:
             for _, row in avoid_df2.head(12).iterrows():
                 md_lines.append("- **{} + {}**  · pair_risk={}  (both_blocked/CoApp={}/{})".format(
@@ -640,7 +640,7 @@ h2 { font-size: 18px; margin: 24px 0 8px; }
         applied_steps = [r for r in seq_rows if r['eliminated_now'] not in (None,0)]
         skipped_steps = [r for r in seq_rows if r.get('skipped_reason')]
         avoid_path = OUTPUT_DIR / "avoid_pairs.csv"
-        avoid_df2 = pd.read_csv(avoid_path) if avoid_path.exists() else pd.DataFrame()
+        avoid_df2 = pd.read_csv(avoid_path) if Path(avoid_path).exists() else pd.DataFrame()
         avoid_sorted = avoid_df2.sort_values(["pair_risk","co_applicable_n"], ascending=[False,False]) if not avoid_df2.empty else avoid_df2
 
         applied_html = df_to_html_table(pd.DataFrame(applied_steps),
