@@ -97,44 +97,62 @@ st.markdown("---")
 with st.expander("Step 2 · Run Recommender", expanded=True):
     st.write("Provide today's seed context (no winner needed). Leave Keep Combo blank if you don't know it.")
 
-    colA, colB = st.columns([1,1])
-    with colA:
-        pool_path = st.text_input("Today pool CSV (optional)", value=DEFAULT_POOL)
-        target_max = st.number_input("Target pool size (stop when ≤ this)", min_value=10, max_value=200, value=44, step=1)
-        always_keep = st.checkbox("Preserve winner (winner-agnostic safe mode if unknown)", value=True)
-        minimize_beyond_target = st.checkbox("Keep minimizing even after target reached", value=True)
-    with colB:
-        st.caption("Seed triplet (optional, improves case matching)")
-        override_seed = st.text_input("Seed (today's seed / yesterday's draw)", value="")
-        override_prev = st.text_input("Prev seed", value="")
-        override_prevprev = st.text_input("Prev-prev seed", value="")
+    # Use a form so the script doesn't re-run on every keystroke
+    with st.form("run_form"):
+        colA, colB = st.columns([1,1])
+        with colA:
+            pool_path = st.text_input("Today pool CSV (optional)", value=DEFAULT_POOL)
+            target_max = st.number_input("Target pool size (stop when ≤ this)", min_value=10, max_value=200, value=44, step=1)
+            always_keep = st.checkbox("Preserve winner (winner-agnostic safe mode if unknown)", value=True)
+            minimize_beyond_target = st.checkbox("Keep minimizing even after target reached", value=True)
+        with colB:
+            st.caption("Seed triplet (optional, improves case matching)")
+            override_seed = st.text_input("Seed (today's seed / yesterday's draw)", value="", max_chars=5, placeholder="#####")
+            override_prev = st.text_input("Prev seed", value="", max_chars=5, placeholder="#####")
+            override_prevprev = st.text_input("Prev-prev seed", value="", max_chars=5, placeholder="#####")
 
-        st.caption("Keep Combo (optional)")
-        force_keep_combo = st.text_input("Keep combo (5 digits)", value="")
+            st.caption("Keep Combo (optional)")
+            force_keep_combo = st.text_input("Keep combo (5 digits)", value="", max_chars=5, placeholder="#####")
 
-    st.caption("Paste Applicable-Only IDs (optional, comma or space separated)")
-    applicable_only = st.text_area("Applicable IDs", value="", height=70)
+        st.caption("Paste Applicable-Only IDs (optional, comma or space separated)")
+        applicable_only = st.text_area("Applicable IDs", value="", height=70)
 
-    if st.button("Run recommender now"):
-        try:
-            kwargs = dict(
-                winners_csv=DEFAULT_WINNERS,
-                filters_csv=DEFAULT_FILTERS,
-                today_pool_csv=pool_path if pool_path else None,
-                target_max=int(target_max),
-                always_keep_winner=bool(always_keep),
-                minimize_beyond_target=bool(minimize_beyond_target),
-                force_keep_combo=force_keep_combo.strip() or None,
-                override_seed=override_seed.strip() or None,
-                override_prev=override_prev.strip() or None,
-                override_prevprev=override_prevprev.strip() or None,
-                applicable_only=applicable_only.strip() or None,
-                train_mode=False,
-            )
-            run_recommender(**kwargs)
-            st.success("Recommender finished.")
-        except Exception as e:
-            st.error(f"Recommender failed: {e}")
+        submitted = st.form_submit_button("Run recommender now")
+
+    def _is_five(s: str) -> bool:
+        s = (s or "").strip()
+        return len(s) == 5 and s.isdigit()
+
+    seeds_ok = True
+    bad_fields = []
+    for label, val in [("Seed", override_seed), ("Prev seed", override_prev), ("Prev-prev seed", override_prevprev), ("Keep combo", force_keep_combo)]:
+        if val.strip() != "" and not _is_five(val):
+            seeds_ok = False
+            bad_fields.append(label)
+
+    if submitted:
+        if not seeds_ok:
+            st.error(f"The following fields must be exactly 5 digits (or left blank): {', '.join(bad_fields)}")
+        else:
+            try:
+                kwargs = dict(
+                    winners_csv=DEFAULT_WINNERS,
+                    filters_csv=DEFAULT_FILTERS,
+                    today_pool_csv=pool_path if pool_path else None,
+                    target_max=int(target_max),
+                    always_keep_winner=bool(always_keep),
+                    minimize_beyond_target=bool(minimize_beyond_target),
+                    force_keep_combo=force_keep_combo.strip() or None,
+                    override_seed=override_seed.strip() or None,
+                    override_prev=override_prev.strip() or None,
+                    override_prevprev=override_prevprev.strip() or None,
+                    applicable_only=applicable_only.strip() or None,
+                    train_mode=False,
+                )
+                run_recommender(**kwargs)
+                st.success("Recommender finished.")
+            except Exception as e:
+                st.error(f"Recommender failed: {e}")
 
 st.markdown("---")
 
