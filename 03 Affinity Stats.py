@@ -86,3 +86,23 @@ if not run_called:
 
 if err:
     st.error(err)
+
+
+# --- Archive today's pool for historical testing ---
+from pathlib import Path
+
+with st.expander("Archive today's pool for historical tests", expanded=False):
+    # Use the same path your app uses; fallback to repo-root today_pool.csv
+    pool_path = getattr(recommender, "TODAY_POOL_CSV", None) or "today_pool.csv"
+    st.caption(f"Pool file: {pool_path}")
+
+    if Path(pool_path).exists():
+        if st.button("Archive today's pool now"):
+            try:
+                from recommender import archive_today_pool
+                dest = archive_today_pool(pool_csv=pool_path)  # uses WINNERS_CSV to name by date
+                st.success(f"Archived to {dest}")
+            except Exception as e:
+                st.error(f"Archive failed: {e}")
+    else:
+        st.info("No pool file found yet. Make sure today_pool.csv exists at repo root or set recommender.TODAY_POOL_CSV.")
