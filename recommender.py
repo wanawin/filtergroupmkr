@@ -25,6 +25,64 @@ OUTPUT_DIR = Path(".")
 from pathlib import Path
 import pandas as pd
 import shutil
+# ===== FINAL OVERRIDE: correct get_pool_for_seed (real archived pools) =====
+from pathlib import Path
+import pandas as pd
+
+# Where dated pools live, e.g. pools/pool_2025-08-22.csv
+POOL_ARCHIVE_DIR = Path("pools")
+
+def get_pool_for_seed(seed_row, *, keep_permutations: bool = True) -> pd.DataFrame:
+    """
+    Load the EXACT pool your app had at the pre-CSV stage for this seed's date.
+
+    Strategy:
+      1) If the seed row has a Date/DrawDate, try pools/pool_YYYY-MM-DD.csv.
+      2) Else/fallback to TODAY_POOL_CSV or repo-root today_pool.csv.
+
+    Returns a DataFrame with a 'combo' column of 5-digit strings.
+    """
+    # Try to read the seed’s date (if present)
+    date_val = None
+    for c in getattr(seed_row, "index", []):
+        lc = str(c).lower()
+        if lc in ("date", "drawdate", "draw_date"):
+            try:
+                date_val = pd.to_datetime(seed_row[c], errors="coerce").date()
+            except Exception:
+                date_val = None
+            break
+
+    df = None
+    # 1) Archived pool by date
+    if date_val:
+        arch = POOL_ARCHIVE_DIR / f"pool_{date_val}.csv"
+        if arch.exists():
+            df = pd.read_csv(arch)
+
+    # 2) Fallback to today's pool
+    if df is None:
+        fallback = (globals().get("TODAY_POOL_CSV") or "today_pool.csv")
+        if not Path(fallback).exists():
+            raise FileNotFoundError(
+                f"No archived pool found for {date_val} and no {fallback} present. "
+                f"Archive today’s pool (see archive_today_pool) or add pools/pool_<date>.csv."
+            )
+        df = pd.read_csv(fallback)
+
+    # Normalize to a 'combo' column of 5-digit strings
+    if "combo" not in df.columns:
+        if "Result" in df.columns:
+            df = df.rename(columns={"Result": "combo"})
+        else:
+            raise RuntimeError("Pool CSV must contain 'combo' or 'Result' column.")
+    df["combo"] = (
+        df["combo"].astype(str).str.replace(r"\D", "", regex=True).str.zfill(5)
+    )
+    df = df[df["combo"].str.fullmatch(r"\d{5}")]
+    return df[["combo"]].copy()
+# ===== END OVERRIDE =====
+
 
 POOL_ARCHIVE_DIR = Path("pools")  # stores pools/pool_YYYY-MM-DD.csv
 
