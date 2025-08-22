@@ -554,7 +554,7 @@ def main(
         do_not_df = do_not_df.sort_values(
             by=["tier","risk","support","filter_id"],
             ascending=[True, False, False, True],
-            key=lambda s: s.map(tier_order) if s.name == "tier" else None
+           key=lambda s: s.map(tier_order) if s.name == "tier" else s
         )
         do_not_df.to_csv(OUTPUT_DIR / "do_not_apply.csv", index=False)
 
