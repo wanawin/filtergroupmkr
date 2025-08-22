@@ -14,11 +14,16 @@ st.markdown(
 This page evaluates where the **actual winner** lands in the **affinity ranking**
 built from that day's seed.
 
-Pool construction matches your production recipe:
-- 1-digit rule only (combo must share ≥1 distinct digit with the seed)
-- optional digit-sum percentile filter measured against the full 2002 canonical combos
-- canonical, de-duplicated combos by construction
-- remove quints and quads
+Pipeline (matches your validated order of operations):
+1) Enumerate on full **100k ordered space** (00000..99999)
+2) **SUM percentile filter** measured on the **100k** distribution
+3) **Canonicalize & de-dup** (sorted digits → one multiset per combo)
+4) **Drop quints & quads**
+5) **Intersect** with the 2,002 canonical multisets (safety / consistency)
+
+Options:
+- 1- or 2-digit enumeration rule
+- Optional “winner-heavy” SUM zones on the 100k baseline
 """
 )
 
@@ -67,41 +72,117 @@ else:
 
 
 # -----------------------------------------------
-# Full enumeration (canonical 5-digit multisets)
+# Canonical enumeration (2,002 multisets)
 # -----------------------------------------------
 def full_canonical_multisets():
     return ["".join(str(d) for d in tup) for tup in combinations_with_replacement(range(10), 5)]
 
 
 FULL_CANON = full_canonical_multisets()
-FULL_SUMS = np.array([sum(rec.digits_of(s)) for s in FULL_CANON], dtype=float)
+FULL_CANON_SET = set(FULL_CANON)  # for fast intersection
 
 
-def sum_percentile_bounds(low_pct: float, high_pct: float):
-    low = np.percentile(FULL_SUMS, low_pct * 100.0)
-    high = np.percentile(FULL_SUMS, high_pct * 100.0)
-    return float(low), float(high)
+# -----------------------------------------------
+# 100k ordered space (vectorized digits + sums)
+# -----------------------------------------------
+@st.cache_data
+def _all100k_digits_and_sums():
+    x = np.arange(100000, dtype=np.int32)
+    d0 = (x // 10000) % 10
+    d1 = (x // 1000) % 10
+    d2 = (x // 100) % 10
+    d3 = (x // 10) % 10
+    d4 = x % 10
+    D = np.stack([d0, d1, d2, d3, d4], axis=1).astype(np.int8)   # shape (100000, 5)
+    S = D.sum(axis=1).astype(np.int16)                          # digit sums
+    return D, S
 
 
-def build_pool_1digit_exact(seed_digits, keep_sum_pct=(0.0, 1.0), remove_quints_quads=True):
-    seed_set = set(seed_digits)
-    low_p, high_p = keep_sum_pct
-    low_sum, high_sum = sum_percentile_bounds(low_p, high_p)
+ALLD, ALLS = _all100k_digits_and_sums()
 
-    out = []
-    for s in FULL_CANON:  # canonical and deduped
-        digs = rec.digits_of(s)
-        if len(set(digs) & seed_set) < 1:
-            continue  # 1-digit rule
-        ssum = sum(digs)
-        if not (low_sum <= ssum <= high_sum):
-            continue  # percentile filter vs full enumeration
-        if remove_quints_quads:
-            stc = rec.classify_structure(digs)
-            if stc in {"quint", "quad"}:
-                continue
-        out.append(s)
-    return out
+
+def sum_pct_bounds_100k(low_pct: float, high_pct: float):
+    """Percentile bounds for digit sums on the 100k ordered distribution."""
+    return (
+        float(np.percentile(ALLS, low_pct * 100.0)),
+        float(np.percentile(ALLS, high_pct * 100.0)),
+    )
+
+
+def sum_pct_rank_100k(sum_val: int) -> float:
+    """Percentile rank of a given digit-sum relative to the 100k ordered combos."""
+    # Using CDF via mean of (S <= sum_val)
+    return float((ALLS <= sum_val).mean())
+
+
+# Winner-heavy zones (on 100k baseline) — optional gate
+WINNER_HEAVY_ZONES = [
+    (0.00, 0.26),
+    (0.30, 0.35),
+    (0.36, 0.43),
+    (0.50, 0.60),
+    (0.60, 0.70),
+    (0.80, 0.83),
+    (0.93, 0.94),
+]
+
+
+def build_pool_ordered_then_dedup(
+    seed_digits,
+    digits_required: int = 1,                 # 1 or 2
+    keep_sum_pct: tuple[float, float] = (0.0, 1.0),
+    remove_quints_quads: bool = True,
+    apply_winner_heavy: bool = False,
+):
+    """
+    Enumerate on 100k ordered -> SUM percentile filter (100k baseline)
+    -> canonicalize & de-dup -> drop quints/quads -> intersect with 2,002 canon.
+    """
+    seed_digits = list(seed_digits)
+    seed_vals = np.array(seed_digits, dtype=np.int8)
+    low_sum, high_sum = sum_pct_bounds_100k(*keep_sum_pct)
+
+    # --- masks on the 100k ordered space ---
+    m_sum = (ALLS >= low_sum) & (ALLS <= high_sum)
+
+    # digits_required in {1,2}: count DISTINCT seed digits present per row
+    present_count = np.zeros(ALLD.shape[0], dtype=np.int8)
+    for d in seed_vals:
+        present_count += (ALLD == d).any(axis=1)
+    m_digits = present_count >= digits_required
+
+    if apply_winner_heavy:
+        # Precompute mask covering all winner-heavy ranges (convert pct → sum bounds)
+        m_zone = np.zeros_like(m_sum, dtype=bool)
+        for lo, hi in WINNER_HEAVY_ZONES:
+            lo_s, hi_s = sum_pct_bounds_100k(lo, hi)
+            m_zone |= (ALLS >= lo_s) & (ALLS <= hi_s)
+        m = m_sum & m_digits & m_zone
+    else:
+        m = m_sum & m_digits
+
+    idx = np.flatnonzero(m)
+    if idx.size == 0:
+        return []
+
+    # --- canonicalize & de-dup ---
+    canon_set = set()
+    for i in idx:
+        digs = ALLD[i].tolist()
+        canon = "".join(str(x) for x in sorted(digs))
+        canon_set.add(canon)
+
+    # --- drop quints/quads AFTER canonicalization ---
+    if remove_quints_quads:
+        canon_set = {
+            s for s in canon_set
+            if rec.classify_structure(rec.digits_of(s)) not in {"quint", "quad"}
+        }
+
+    # --- final safety: restrict to the 2,002 canonical universe ---
+    canon_set &= FULL_CANON_SET
+
+    return sorted(canon_set)
 
 
 # -------------------------------
@@ -114,16 +195,23 @@ with col1:
 with col2:
     n_days = st.number_input("Days to test (most recent)", min_value=30, max_value=3000, value=240, step=10)
     sum_pct_keep = st.slider(
-        "Keep SUM percentiles (vs full enumeration)",
+        "Keep SUM percentiles (100k baseline)",
         0.0, 1.0, (0.0, 1.0), 0.05,
-        help="Example: (0.05, 0.95) keeps the middle 90% of sums. Default keeps all."
+        help="Example: (0.05, 0.95) keeps the middle 90% of sums. Evaluated on the 100k ordered distribution."
     )
 
 col3, col4 = st.columns(2)
 with col3:
-    show_hist = st.checkbox("Show 5% percentile histogram", value=True)
+    digits_required = st.radio("Digit rule", options=[1, 2], horizontal=True, index=0,
+                               help="Minimum distinct seed digits that must appear in a combo.")
 with col4:
-    run = st.button("Run Winner Affinity Stats", type="primary")
+    use_winner_heavy = st.checkbox(
+        "Apply winner-heavy SUM zones",
+        value=False,
+        help="Restricts SUM percentile to your empirically winner-heavy bands (on 100k baseline).",
+    )
+
+run = st.button("Run Winner Affinity Stats", type="primary")
 
 
 # -------------------------------
@@ -164,14 +252,21 @@ if run:
         true_win_raw = winners[t]
         true_win = "".join(sorted(true_win_raw))
 
-        pool = build_pool_1digit_exact(seed_digits, keep_sum_pct=sum_pct_keep, remove_quints_quads=True)
+        # Build pool with the validated order
+        pool = build_pool_ordered_then_dedup(
+            seed_digits=seed_digits,
+            digits_required=int(digits_required),
+            keep_sum_pct=tuple(float(x) for x in sum_pct_keep),
+            remove_quints_quads=True,
+            apply_winner_heavy=bool(use_winner_heavy),
+        )
         pool_set = set(pool)
         pool_sizes.append(len(pool))
         kept_flags.append(int(true_win in pool_set))
 
         # Affinity percentile of the winner vs pool
         aff_pool = np.fromiter((combo_affinity(env, c) for c in pool), dtype=float)
-        aff_w = float(combo_affinity(env, true_win))  # order-independent features, but use canonical
+        aff_w = float(combo_affinity(env, true_win))  # features are order-invariant; canonical is fine
         pct = float((aff_pool <= aff_w).mean())  # 0..1
 
         rows.append({
@@ -217,14 +312,13 @@ if run:
         f"Median pool size: {np.median(pool_sizes):.0f}"
     )
 
-    if show_hist:
-        st.subheader("Histogram — Winner Affinity Percentile (5% bins)")
-        bins = np.linspace(0.0, 1.0, 21)  # 0.00, 0.05, ..., 1.00
-        labels = [f"{int(100*b)}–{int(100*bins[i+1])}%" for i, b in enumerate(bins[:-1])]
-        df["pct_bin"] = pd.cut(df["pct"], bins=bins, labels=labels, include_lowest=True)
-        hist = df.groupby("pct_bin").size().rename("days").reset_index()
-        hist["percent"] = (hist["days"] / total_days * 100.0).round(2)
-        st.dataframe(hist, use_container_width=True)
+    st.subheader("Histogram — Winner Affinity Percentile (5% bins)")
+    bins = np.linspace(0.0, 1.0, 21)  # 0.00, 0.05, ..., 1.00
+    labels = [f"{int(100*b)}–{int(100*bins[i+1])}%" for i, b in enumerate(bins[:-1])]
+    df["pct_bin"] = pd.cut(df["pct"], bins=bins, labels=labels, include_lowest=True)
+    hist = df.groupby("pct_bin").size().rename("days").reset_index()
+    hist["percent"] = (hist["days"] / total_days * 100.0).round(2)
+    st.dataframe(hist, use_container_width=True)
 
     st.download_button(
         "Download per-day winner affinity CSV",
