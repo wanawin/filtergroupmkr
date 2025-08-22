@@ -20,16 +20,32 @@ with col1:
     st.subheader("Data")
     default_winners = "DC5_Midday_Full_Cleaned_Expanded.csv"
     winners_path = st.text_input("Winners CSV path", default_winners)
-    uploaded = st.file_uploader("...or upload Winners CSV", type=["csv"], help="If you upload, it will override the path above for this run only.")
+    uploaded = st.file_uploader(
+        "...or upload Winners CSV",
+        type=["csv"],
+        help="If you upload, it will override the path above for this run only.",
+    )
 
 with col2:
     st.subheader("Backtest Settings")
-    n_days = st.number_input("Days to test (most recent)", min_value=30, max_value=2000, value=240, step=10)
-    pool_mode = st.selectbox("Pool mode", ["1digit", "2digit"], index=0, help="1digit: each combo shares ≥1 distinct digit with seed. 2digit: shares ≥2.")
-    pool_size = st.number_input("Pool size per day", min_value=100, max_value=20000, value=1800, step=100)
-    top_pcts = st.text_input("Top % thresholds (comma)", "0.2,0.3", help="e.g., 0.2 = top 20% by affinity")
-        use_archived = st.checkbox("Use archived real pools (recommended)", value=True)
-
+    n_days = st.number_input(
+        "Days to test (most recent)", min_value=30, max_value=2000, value=240, step=10
+    )
+    pool_mode = st.selectbox(
+        "Pool mode",
+        ["1digit", "2digit"],
+        index=0,
+        help="1digit: each combo shares ≥1 distinct digit with seed. 2digit: shares ≥2.",
+    )
+    pool_size = st.number_input(
+        "Pool size per day", min_value=100, max_value=20000, value=1800, step=100
+    )
+    top_pcts = st.text_input(
+        "Top % thresholds (comma)",
+        "0.2,0.3",
+        help="e.g., 0.2 = top 20% by affinity",
+    )
+    use_archived = st.checkbox("Use archived real pools (recommended)", value=True)
 
 out_prefix = "parity_affinity"
 run = st.button("▶️ Run Backtest", type="primary")
@@ -48,18 +64,27 @@ if run:
     cmd = [
         sys.executable,
         "affinity_parity_backtest.py",
-        "--winners", winners_to_use,
-        "--n_days", str(int(n_days)),
-        "--pool_mode", pool_mode,
-        "--pool_size", str(int(pool_size)),
-        "--top_pcts", top_pcts,
-        "--out_prefix", out_prefix,
+        "--winners",
+        winners_to_use,
+        "--n_days",
+        str(int(n_days)),
+        "--pool_mode",
+        pool_mode,
+        "--pool_size",
+        str(int(pool_size)),
+        "--top_pcts",
+        top_pcts,
+        "--out_prefix",
+        out_prefix,
     ]
+
+    # real-pool mode flag
     if use_archived:
         cmd.append("--use_archived_pools")
 
-
-    st.info("Running backtest... this analyzes historical days and writes two CSVs below.")
+    st.info(
+        "Running backtest... this analyzes historical days and writes two CSVs below."
+    )
     with st.spinner("Working..."):
         result = subprocess.run(cmd, capture_output=True, text=True)
 
@@ -79,7 +104,13 @@ if run:
             st.subheader("Summary (accuracy & lift)")
             df_sum = pd.read_csv(sum_path)
             st.dataframe(df_sum, use_container_width=True)
-            st.download_button("Download summary CSV", data=open(sum_path, "rb").read(), file_name=sum_path, mime="text/csv")
+            with open(sum_path, "rb") as fh:
+                st.download_button(
+                    "Download summary CSV",
+                    data=fh.read(),
+                    file_name=sum_path,
+                    mime="text/csv",
+                )
         else:
             st.warning("Summary CSV not found.")
 
@@ -87,11 +118,19 @@ if run:
             st.subheader("Per-day results")
             df_day = pd.read_csv(day_path)
             st.dataframe(df_day, use_container_width=True)
-            st.download_button("Download per-day CSV", data=open(day_path, "rb").read(), file_name=day_path, mime="text/csv")
+            with open(day_path, "rb") as fh:
+                st.download_button(
+                    "Download per-day CSV",
+                    data=fh.read(),
+                    file_name=day_path,
+                    mime="text/csv",
+                )
         else:
             st.warning("Per-day CSV not found.")
 
-st.caption("Tip: Use '1digit' & pool size ~1800 to mirror your normal pool. Try '2digit' & ~900 to see if stricter pools change the signal.")
+st.caption(
+    "Tip: Use '1digit' & pool size ~1800 to mirror your normal pool. Try '2digit' & ~900 to see if stricter pools change the signal."
+)
 
 # -----------------------------------------------------------------------------
 # NEW: Probabilistic Parity (Bucket Prior)
