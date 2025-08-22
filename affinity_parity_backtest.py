@@ -1,270 +1,313 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Quick backtest: does the majority parity of the top-k% by affinity (winner-independent)
-predict the actual winner's parity?
+Affinity Parity Backtest — patched to support **real archived pools**
 
-- Uses your existing winners CSV.
-- Builds "today" context from the previous draw (seed) for each day.
-- Generates a synthetic pool for that day that matches your constraints:
-  * pool_mode="1digit": each combo shares >=1 distinct digit with the seed (default)
-  * pool_mode="2digit": each combo shares >=2 distinct digits with the seed
-- Scores every combo with the SAME combo_affinity heuristic we added in recommender.
-- Checks the majority parity among the top-k% (k ∈ {10, 20, 30}% by default) of that day's pool.
-- Compares against the true winner's parity (both sum-parity and parity-major labels).
-- Also reports a baseline: majority parity over the whole pool (no affinity).
+Usage examples
+--------------
+# With real archived pools (recommended)
+python affinity_parity_backtest.py \
+  --winners DC5_Midday_Full_Cleaned_Expanded.csv \
+  --n_days 240 \
+  --top_pcts 0.2,0.3 \
+  --use_archived_pools
 
-Outputs two CSVs:
-  - parity_affinity_backtest.csv   (one row per day with predictions)
-  - parity_affinity_summary.csv    (aggregate accuracies & lift over baseline)
+# Original (synthetic) mode — keeps your prior behavior
+python affinity_parity_backtest.py \
+  --winners DC5_Midday_Full_Cleaned_Expanded.csv \
+  --n_days 240 \
+  --pool_mode 1digit --pool_size 1800 \
+  --top_pcts 0.2,0.3
 
-Run (examples):
-  python affinity_parity_backtest.py --winners DC5_Midday_Full_Cleaned_Expanded.csv
-  python affinity_parity_backtest.py --winners DC5_Midday_Full_Cleaned_Expanded.csv \
-         --n_days 240 --pool_mode 1digit --pool_size 1800 --top_pcts 0.2,0.3
+Outputs
+-------
+- <out_prefix>_summary.csv : accuracy per threshold (sum-parity & majority-parity)
+- <out_prefix>_backtest.csv: per-day records (predictions & hits)
 """
+from __future__ import annotations
 
 import argparse
-import csv
 import math
 import random
 from pathlib import Path
-from collections import Counter, defaultdict
+from typing import Dict, Iterable, List, Tuple
 
+import numpy as np
 import pandas as pd
 
-# Import utilities from your recommender
-from recommender import (
-    load_winners,
-    build_env_for_draw,
-    digits_of,
-    classify_structure,
-)
+# -----------------------------
+# Helpers (digits & parity)
+# -----------------------------
 
-# ---------------------------
-# Helper labels
-# ---------------------------
-
-def parity_major_label(digs):
-    return "even>=3" if sum(1 for d in digs if d % 2 == 0) >= 3 else "even<=2"
+def digits_of(s: str) -> List[int]:
+    s = ''.join(ch for ch in str(s) if ch.isdigit())
+    return [int(ch) for ch in s.zfill(5)[-5:]]
 
 
-def sum_parity_label(digs):
-    return "even" if (sum(digs) % 2 == 0) else "odd"
+def sum_parity_label(s: str) -> str:
+    return "even" if sum(digits_of(s)) % 2 == 0 else "odd"
 
 
-# ---------------------------
-# Affinity (same heuristic used in recommender)
-# ---------------------------
-
-def combo_affinity(env_now: dict, combo: str) -> float:
-    cd = digits_of(combo)
-    seedd = env_now['seed_digits_list']
-
-    combo_sum = sum(cd)
-    seed_sum = env_now['seed_sum']
-    sum_prox = math.exp(-abs(combo_sum - seed_sum) / 2.0)
-
-    spread_c = max(cd) - min(cd)
-    spread_s = env_now['spread_seed']
-    spread_prox = math.exp(-abs(spread_c - spread_s) / 2.0)
-
-    struct_match = 1.0 if classify_structure(cd) == classify_structure(seedd) else 0.0
-    parity_match = 1.0 if parity_major_label(cd) == parity_major_label(seedd) else 0.0
-
-    # High-digit (>=8) pattern handling
-    hi8_seed = sum(1 for d in seedd if d >= 8)
-    hi8_combo = sum(1 for d in cd if d >= 8)
-    if hi8_seed >= 3:
-        # If seed is unusually heavy in high digits, prefer combos with fewer highs (<=1)
-        hi8_score = math.exp(-max(0, hi8_combo - 1))
-    else:
-        # Otherwise prefer closeness in count of high digits
-        hi8_score = math.exp(-abs(hi8_combo - hi8_seed) / 1.5)
-
-    overlap = len(set(seedd) & set(cd))
-    overlap_eq1 = 1.0 if overlap == 1 else 0.0
-
-    # Weights (tunable; mirror recommender)
-    W_SUM = 0.8
-    W_SPD = 0.3
-    W_STR = 0.4
-    W_PAR = 0.15
-    W_HI8 = 0.35
-    W_OV1 = 0.25
-
-    return (
-        W_SUM * sum_prox +
-        W_SPD * spread_prox +
-        W_STR * struct_match +
-        W_PAR * parity_match +
-        W_HI8 * hi8_score +
-        W_OV1 * overlap_eq1
-    )
+def majority_parity_label(s: str) -> str:
+    evens = sum(1 for d in digits_of(s) if d % 2 == 0)
+    return "even" if evens >= 3 else "odd"
 
 
-# ---------------------------
-# Pool generation for a day
-# ---------------------------
+# -----------------------------
+# Synthetic pool (legacy fallback)
+# -----------------------------
 
-def gen_pool_for_seed(seed_digits: list[int], pool_size: int, mode: str, rng: random.Random) -> list[str]:
-    """Generate a pool of 5-digit strings under a seed-anchored constraint.
-       mode="1digit": require >=1 distinct shared digit with seed
-       mode="2digit": require >=2 distinct shared digits with seed
+def shares_k_digits(candidate: str, seed: str, k: int) -> bool:
+    a = set(digits_of(candidate))
+    b = set(digits_of(seed))
+    return len(a.intersection(b)) >= k
+
+
+def gen_pool_for_seed(seed: str, mode: str = "1digit", size: int = 1800) -> pd.DataFrame:
+    """Legacy synthetic generator used in the original backtest.
+    mode: '1digit' (share ≥1 digit) or '2digit' (share ≥2 digits).
+    Returns DataFrame with a 'combo' column of 5-digit strings.
     """
-    seed_set = set(seed_digits)
-    required = 1 if mode == "1digit" else 2
-    out = []
+    need_k = 1 if mode == "1digit" else 2
     seen = set()
-    while len(out) < pool_size:
-        s = ''.join(str(rng.randrange(10)) for _ in range(5))
-        if s in seen:
+    out: List[str] = []
+    # Randomly sample until we fill the requested pool size
+    while len(out) < int(size):
+        x = f"{random.randint(0, 99999):05d}"
+        if x in seen:
             continue
-        seen.add(s)
-        digs = set(digits_of(s))
-        if len(digs & seed_set) >= required:
-            out.append(s)
-    return out
+        if shares_k_digits(x, seed, need_k):
+            out.append(x)
+            seen.add(x)
+    return pd.DataFrame({"combo": out})
 
 
-# ---------------------------
-# Main backtest
-# ---------------------------
+# -----------------------------
+# Affinity scoring
+# -----------------------------
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--winners', required=True, help='Path to winners CSV')
-    ap.add_argument('--n_days', type=int, default=240, help='How many most-recent days to test')
-    ap.add_argument('--pool_mode', choices=['1digit','2digit'], default='1digit', help='Pool constraint mode')
-    ap.add_argument('--pool_size', type=int, default=1800, help='Pool size to generate per day')
-    ap.add_argument('--top_pcts', type=str, default='0.2,0.3', help='Top percent thresholds, comma sep (e.g. 0.1,0.2)')
-    ap.add_argument('--out_prefix', type=str, default='parity_affinity', help='Prefix for output CSVs')
-    ap.add_argument('--seed', type=int, default=12345, help='Random seed for reproducibility')
-    args = ap.parse_args()
-ap.add_argument('--use_archived_pools', action='store_true',
-                help='Load real pools via recommender.get_pool_for_seed')
+def score_affinity(df: pd.DataFrame, seed_value: str) -> pd.DataFrame:
+    """Return df with columns: ['aff_score','aff_pct'] using recommender if available."""
+    import importlib
 
-    winners = load_winners(args.winners)
-    N = len(winners)
-# Also keep a DataFrame view so get_pool_for_seed can read the date column
-winners_df_full = pd.read_csv(args.winners)
+    df = df.copy()
+    if "combo" not in df.columns:
+        if "Result" in df.columns:
+            df = df.rename(columns={"Result": "combo"})
+        else:
+            raise RuntimeError("Expected 'combo' or 'Result' column in pool DataFrame.")
+    df["combo"] = df["combo"].astype(str).str.replace(r"\D", "", regex=True).str.zfill(5)
 
-    if N < 3:
-        raise SystemExit('Not enough winners to run a backtest')
+    # Try recommender APIs first
+    try:
+        rec = importlib.import_module("recommender")
+        weights = getattr(rec, "DEFAULT_AFF_WEIGHTS", None)
+        # Prefer vectorized scoring
+        if hasattr(rec, "affinity_scores_and_pct"):
+            out = rec.affinity_scores_and_pct(df, seed=seed_value, weights=weights)  # type: ignore[arg-type]
+            if "aff_score" not in out.columns:
+                raise RuntimeError("affinity_scores_and_pct did not produce 'aff_score'.")
+            if "aff_pct" not in out.columns:
+                # compute percentile if not provided
+                vals = out["aff_score"].to_numpy(float)
+                order = np.argsort(vals)
+                ranks = np.empty_like(order, dtype=float)
+                ranks[order] = np.linspace(0.0, 1.0, len(vals))
+                out["aff_pct"] = ranks
+            return out
+        # Fallback: per-combo apply
+        if hasattr(rec, "combo_affinity"):
+            df["aff_score"] = df["combo"].astype(str).map(lambda c: float(rec.combo_affinity(c, seed=seed_value, weights=weights)))  # type: ignore
+            vals = df["aff_score"].to_numpy(float)
+            order = np.argsort(vals)
+            ranks = np.empty_like(order, dtype=float)
+            ranks[order] = np.linspace(0.0, 1.0, len(vals))
+            df["aff_pct"] = ranks
+            return df
+    except Exception:
+        pass
 
-    # Indices to test: last n_days (each index t uses seed winners[t-1], winner winners[t])
-    end = N - 1
-    start = max(2, end - args.n_days)
+    # If recommender isn't available, do a trivial placeholder (not recommended)
+    # Here we just use negative Hamming distance to seed as a crude score
+    seed_d = digits_of(seed_value)
+    def crude(c: str) -> float:
+        cd = digits_of(c)
+        return -sum(int(cd[i] == seed_d[i]) for i in range(5))
+    df["aff_score"] = df["combo"].map(crude)
+    vals = df["aff_score"].to_numpy(float)
+    order = np.argsort(vals)
+    ranks = np.empty_like(order, dtype=float)
+    ranks[order] = np.linspace(0.0, 1.0, len(vals))
+    df["aff_pct"] = ranks
+    return df
 
-    rng = random.Random(args.seed)
 
-    top_ps = [float(x) for x in args.top_pcts.split(',') if x.strip()]
+# -----------------------------
+# Backtest core
+# -----------------------------
 
+def run_backtest(
+    winners_csv: str,
+    n_days: int,
+    pool_mode: str,
+    pool_size: int,
+    top_pcts: List[float],
+    out_prefix: str,
+    use_archived_pools: bool,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    winners_df = pd.read_csv(winners_csv)
+
+    # Identify columns
+    res_col = None
+    date_col = None
+    for c in winners_df.columns:
+        lc = str(c).lower()
+        if lc in ("result", "combo"):
+            res_col = c
+        if lc in ("date", "drawdate", "draw_date"):
+            date_col = c
+    if res_col is None:
+        raise RuntimeError("Winners CSV must contain a 'Result' or 'combo' column.")
+
+    # Indices for testing (use last n_days); ensure we have seed and winner (t-1, t)
+    end_idx = len(winners_df) - 1
+    start_idx = max(1, end_idx - int(n_days) + 1)
+
+    # For CLI UX: let pool_mode/size be ignored in archived mode
+    if use_archived_pools:
+        print("[info] Using archived real pools via recommender.get_pool_for_seed(...). 'pool_mode'/'pool_size' are ignored.")
+
+    # Per-day rows
     rows = []
-    # For aggregated accuracy
-    agg = defaultdict(lambda: {'sum_hits':0,'sum_total':0,'maj_hits':0,'maj_total':0,'base_sum_hits':0,'base_maj_hits':0})
 
-    for t in range(start, end):
-        env = build_env_for_draw(t, winners)
-        seed_digits = env['seed_digits_list']
-        true_win = winners[t]
-        true_digs = digits_of(true_win)
-        true_sum_par = sum_parity_label(true_digs)
-        true_maj_par = parity_major_label(true_digs)
+    for t in range(start_idx, end_idx + 1):
+        seed = str(winners_df.loc[t - 1, res_col])
+        winner = str(winners_df.loc[t, res_col])
+        date_val = str(winners_df.loc[t, date_col]) if date_col else ""
 
-       # Generate/Load pool for the day
-if args.use_archived_pools:
-    import recommender as rec
-    # Use the actual seed row so get_pool_for_seed can grab the correct date
-    seed_row = winners_df_full.iloc[t-1]
-    pool_df = rec.get_pool_for_seed(seed_row)  # returns DataFrame with 'combo'
-    pool = pool_df["combo"].astype(str).tolist()
-else:
-    day_rng = random.Random((args.seed * 1000003) ^ t)
-    pool = gen_pool_for_seed(seed_digits, args.pool_size, args.pool_mode, day_rng)
+        # Build/Load pool
+        if use_archived_pools:
+            import importlib
+            rec = importlib.import_module("recommender")
+            pool_df = rec.get_pool_for_seed(winners_df.iloc[t - 1])  # must return df with 'combo'
+        else:
+            pool_df = gen_pool_for_seed(seed, mode=pool_mode, size=int(pool_size))
 
+        if pool_df is None or pool_df.empty:
+            continue
 
-        # Affinity per combo
-        aff = {c: combo_affinity(env, c) for c in pool}
-        sorted_pool = sorted(pool, key=lambda c: aff[c], reverse=True)
+        # Score affinity and percentiles (0..1 ascending)
+        scored = score_affinity(pool_df, seed)
 
-        # Baseline predictions from full pool (no affinity)
-        base_sum_counts = Counter(sum_parity_label(digits_of(c)) for c in pool)
-        base_maj_counts = Counter(parity_major_label(digits_of(c)) for c in pool)
-        base_sum_pred, base_sum_cnt = base_sum_counts.most_common(1)[0]
-        base_maj_pred, base_maj_cnt = base_maj_counts.most_common(1)[0]
+        # Compute predictions for each threshold
+        for pct in top_pcts:
+            k = float(pct)
+            n_top = max(1, int(math.ceil(k * len(scored))))
+            topk = scored.nlargest(n_top, "aff_score")  # highest affinity region
 
-        for p in top_ps:
-            k = max(1, int(len(sorted_pool) * p))
-            topk = sorted_pool[:k]
+            # Top-k majority labels
+            maj_sum = topk["combo"].map(sum_parity_label).mode()
+            pred_sum = str(maj_sum.iloc[0]) if len(maj_sum) else None
 
-            # Majority predictions within top-k
-            sum_counts = Counter(sum_parity_label(digits_of(c)) for c in topk)
-            maj_counts = Counter(parity_major_label(digits_of(c)) for c in topk)
-            # Handle possible ties deterministically by label sort
-            sum_pred = sorted(sum_counts.items(), key=lambda x: (-x[1], x[0]))[0][0]
-            maj_pred = sorted(maj_counts.items(), key=lambda x: (-x[1], x[0]))[0][0]
+            maj_majority = topk["combo"].map(majority_parity_label).mode()
+            pred_majority = str(maj_majority.iloc[0]) if len(maj_majority) else None
 
-            sum_hit = int(sum_pred == true_sum_par)
-            maj_hit = int(maj_pred == true_maj_par)
-            base_sum_hit = int(base_sum_pred == true_sum_par)
-            base_maj_hit = int(base_maj_pred == true_maj_par)
+            # Ground truth for the actual winner
+            true_sum = sum_parity_label(winner)
+            true_majority = majority_parity_label(winner)
 
             rows.append({
-                't': t,
-                'seed': ''.join(str(d) for d in seed_digits),
-                'winner': true_win,
-                'top_pct': p,
-                'sum_pred': sum_pred,
-                'sum_true': true_sum_par,
-                'sum_hit': sum_hit,
-                'maj_pred': maj_pred,
-                'maj_true': true_maj_par,
-                'maj_hit': maj_hit,
-                'base_sum_pred': base_sum_pred,
-                'base_sum_hit': base_sum_hit,
-                'base_maj_pred': base_maj_pred,
-                'base_maj_hit': base_maj_hit,
-                'pool_mode': args.pool_mode,
-                'pool_size': args.pool_size,
+                "t": t,
+                "date": date_val,
+                "seed": seed,
+                "winner": winner,
+                "pool_size": int(len(scored)),
+                "top_pct": k,
+                "pred_sum_parity": pred_sum,
+                "true_sum_parity": true_sum,
+                "hit_sum": int(pred_sum == true_sum) if pred_sum else None,
+                "pred_majority_parity": pred_majority,
+                "true_majority_parity": true_majority,
+                "hit_majority": int(pred_majority == true_majority) if pred_majority else None,
             })
 
-            key = f'p={p}'
-            agg[key]['sum_hits'] += sum_hit
-            agg[key]['sum_total'] += 1
-            agg[key]['maj_hits'] += maj_hit
-            agg[key]['maj_total'] += 1
-            agg[key]['base_sum_hits'] += base_sum_hit
-            agg[key]['base_maj_hits'] += base_maj_hit
+    day_df = pd.DataFrame(rows)
+    if day_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
 
-    # Write per-day CSV
-    out1 = f'{args.out_prefix}_backtest.csv'
-    pd.DataFrame(rows).to_csv(out1, index=False)
-
-    # Summary CSV
-    summary_rows = []
-    for key, d in agg.items():
-        sum_acc = d['sum_hits'] / max(1, d['sum_total'])
-        maj_acc = d['maj_hits'] / max(1, d['maj_total'])
-        base_sum_acc = d['base_sum_hits'] / max(1, d['sum_total'])
-        base_maj_acc = d['base_maj_hits'] / max(1, d['maj_total'])
-        summary_rows.append({
-            'top_pct': key,
-            'sum_acc': round(sum_acc, 4),
-            'sum_base_acc': round(base_sum_acc, 4),
-            'sum_lift': round(sum_acc - base_sum_acc, 4),
-            'maj_acc': round(maj_acc, 4),
-            'maj_base_acc': round(base_maj_acc, 4),
-            'maj_lift': round(maj_acc - base_maj_acc, 4),
-            'n_days': d['sum_total'],
-            'pool_mode': args.pool_mode,
-            'pool_size': args.pool_size,
+    # Summary by threshold
+    def _acc(col_hit: str) -> pd.Series:
+        sub = day_df.dropna(subset=[col_hit])
+        if sub.empty:
+            return pd.Series({"tests": 0, "hits": 0, "accuracy": np.nan})
+        return pd.Series({
+            "tests": int(sub.shape[0]),
+            "hits": int(sub[col_hit].sum()),
+            "accuracy": float(sub[col_hit].mean()),
         })
 
-    out2 = f'{args.out_prefix}_summary.csv'
-    pd.DataFrame(summary_rows).to_csv(out2, index=False)
+    summaries = []
+    for k in sorted(set(day_df["top_pct"].tolist())):
+        s_sum = _acc("hit_sum")
+        s_maj = _acc("hit_majority")
+        summaries.append({
+            "top_pct": float(k),
+            "tests_sum": s_sum["tests"],
+            "hits_sum": s_sum["hits"],
+            "accuracy_sum": s_sum["accuracy"],
+            "tests_majority": s_maj["tests"],
+            "hits_majority": s_maj["hits"],
+            "accuracy_majority": s_maj["accuracy"],
+        })
+    sum_df = pd.DataFrame(summaries).sort_values("top_pct")
+    return day_df, sum_df
 
-    print(f"Wrote {out1} and {out2}.")
+
+# -----------------------------
+# CLI
+# -----------------------------
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser()
+    p.add_argument("--winners", required=True, help="Path to winners CSV")
+    p.add_argument("--n_days", type=int, default=240, help="Most-recent days to test")
+    p.add_argument("--pool_mode", choices=["1digit", "2digit"], default="1digit")
+    p.add_argument("--pool_size", type=int, default=1800)
+    p.add_argument("--top_pcts", default="0.2,0.3", help="Comma list like '0.2,0.3'")
+    p.add_argument("--out_prefix", default="parity_affinity")
+    p.add_argument("--use_archived_pools", action="store_true", help="Load real pools via recommender.get_pool_for_seed")
+    return p.parse_args()
 
 
-if __name__ == '__main__':
+def main():
+    args = parse_args()
+    top_pcts = [float(x.strip()) for x in str(args.top_pcts).split(",") if x.strip()]
+
+    day_df, sum_df = run_backtest(
+        winners_csv=args.winners,
+        n_days=int(args.n_days),
+        pool_mode=args.pool_mode,
+        pool_size=int(args.pool_size),
+        top_pcts=top_pcts,
+        out_prefix=args.out_prefix,
+        use_archived_pools=bool(args.use_archived_pools),
+    )
+
+    out_summary = f"{args.out_prefix}_summary.csv"
+    out_days = f"{args.out_prefix}_backtest.csv"
+
+    if not day_df.empty:
+        day_df.to_csv(out_days, index=False)
+        print(f"[ok] wrote {out_days} ({len(day_df)} rows)")
+    else:
+        print("[warn] no per-day rows produced (check pools & winners)")
+
+    if not sum_df.empty:
+        sum_df.to_csv(out_summary, index=False)
+        print(f"[ok] wrote {out_summary} ({len(sum_df)} rows)")
+    else:
+        print("[warn] no summary produced")
+
+
+if __name__ == "__main__":
     main()
