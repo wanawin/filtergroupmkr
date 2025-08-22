@@ -21,6 +21,90 @@ TARGET_MAX = 44
 ALWAYS_KEEP_WINNER = True
 MINIMIZE_BEYOND_TARGET = True
 OUTPUT_DIR = Path(".")
+# --- Pool archive support (real per-day pools, no simulation) ---
+from pathlib import Path
+import pandas as pd
+import shutil
+
+POOL_ARCHIVE_DIR = Path("pools")  # stores pools/pool_YYYY-MM-DD.csv
+
+def archive_today_pool(winners_csv: str = WINNERS_CSV, pool_csv: str = "today_pool.csv") -> str:
+    """
+    Copy today's pool to pools/pool_YYYY-MM-DD.csv (uses most recent date in winners CSV).
+    Returns the destination path as a string.
+    """
+    pool_p = Path(pool_csv)
+    if not pool_p.exists():
+        raise FileNotFoundError(f"Pool file not found: {pool_csv}")
+
+    dfw = pd.read_csv(winners_csv)
+    date_col = None
+    for c in dfw.columns:
+        lc = str(c).lower()
+        if lc in ("date", "drawdate", "draw_date"):
+            date_col = c
+            break
+
+    draw_date = None
+    if date_col is not None and len(dfw):
+        try:
+            draw_date = pd.to_datetime(dfw[date_col].iloc[-1], errors="coerce").date()
+        except Exception:
+            draw_date = None
+
+    POOL_ARCHIVE_DIR.mkdir(exist_ok=True)
+    dest = POOL_ARCHIVE_DIR / f"pool_{(draw_date or 'unknown')}.csv"
+    shutil.copy2(pool_p, dest)
+    return str(dest)
+
+def get_pool_for_seed(seed_row, *, keep_permutations: bool = True) -> pd.DataFrame:
+    """
+    Load the EXACT pool your app had at the pre-CSV stage for this seed's date.
+
+    Strategy:
+      1) If the seed row has a Date/DrawDate, try pools/pool_YYYY-MM-DD.csv.
+      2) Else/fallback to TODAY_POOL_CSV or repo-root today_pool.csv.
+    """
+    # Try to read the seed’s date (if present)
+    date_val = None
+    for c in getattr(seed_row, 'index', []):
+        lc = str(c).lower()
+        if lc in ("date", "drawdate", "draw_date"):
+            try:
+                date_val = pd.to_datetime(seed_row[c], errors="coerce").date()
+            except Exception:
+                date_val = None
+            break
+
+    df = None
+    # 1) Archived pool by date
+    if date_val:
+        arch = POOL_ARCHIVE_DIR / f"pool_{date_val}.csv"
+        if arch.exists():
+            df = pd.read_csv(arch)
+
+    # 2) Fallback to today's pool
+    if df is None:
+        fallback = (globals().get("TODAY_POOL_CSV") or "today_pool.csv")
+        if not Path(fallback).exists():
+            raise FileNotFoundError(
+                f"No archived pool found for {date_val} and no {fallback} present. "
+                f"Archive today’s pool (see archive_today_pool) or add pools/pool_<date>.csv."
+            )
+        df = pd.read_csv(fallback)
+
+    # Normalize to a 'combo' column of 5-digit strings
+    if "combo" not in df.columns:
+        if "Result" in df.columns:
+            df = df.rename(columns={"Result": "combo"})
+        else:
+            raise RuntimeError("Pool CSV must contain 'combo' or 'Result' column.")
+    df["combo"] = (
+        df["combo"].astype(str).str.replace(r"\D", "", regex=True).str.zfill(5)
+    )
+    df = df[df["combo"].str.fullmatch(r"\d{5}")]
+    return df[["combo"]].copy()
+
 def get_pool_for_seed(seed_row, *, keep_permutations=True):
     """
     Return the EXACT pool your main app has at the affinity pre-trim stage.
