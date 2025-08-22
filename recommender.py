@@ -2,14 +2,16 @@
 from __future__ import annotations
 
 import math
-import pandas as pd
+import html
+import shutil
+import itertools as it
 from dataclasses import dataclass
 from collections import Counter
 from typing import Dict, List, Tuple, Optional
 from pathlib import Path
-import itertools as it
-import html
+
 import numpy as np
+import pandas as pd
 
 # =========================
 # Defaults (UI can override)
@@ -21,16 +23,40 @@ TARGET_MAX = 44
 ALWAYS_KEEP_WINNER = True
 MINIMIZE_BEYOND_TARGET = True
 OUTPUT_DIR = Path(".")
-# --- Pool archive support (real per-day pools, no simulation) ---
-from pathlib import Path
-import pandas as pd
-import shutil
-# ===== FINAL OVERRIDE: correct get_pool_for_seed (real archived pools) =====
-from pathlib import Path
-import pandas as pd
 
-# Where dated pools live, e.g. pools/pool_2025-08-22.csv
-POOL_ARCHIVE_DIR = Path("pools")
+# =========================
+# Pool archive (real per-day pools)
+# =========================
+POOL_ARCHIVE_DIR = Path("pools")  # stores pools/pool_YYYY-MM-DD.csv
+
+def archive_today_pool(winners_csv: str = WINNERS_CSV, pool_csv: str = "today_pool.csv") -> str:
+    """
+    Copy today's pool to pools/pool_YYYY-MM-DD.csv (uses most recent date in winners CSV).
+    Returns the destination path as a string.
+    """
+    pool_p = Path(pool_csv)
+    if not pool_p.exists():
+        raise FileNotFoundError(f"Pool file not found: {pool_csv}")
+
+    dfw = pd.read_csv(winners_csv)
+    date_col = None
+    for c in dfw.columns:
+        lc = str(c).lower()
+        if lc in ("date", "drawdate", "draw_date"):
+            date_col = c
+            break
+
+    draw_date = None
+    if date_col is not None and len(dfw):
+        try:
+            draw_date = pd.to_datetime(dfw[date_col].iloc[-1], errors="coerce").date()
+        except Exception:
+            draw_date = None
+
+    POOL_ARCHIVE_DIR.mkdir(exist_ok=True)
+    dest = POOL_ARCHIVE_DIR / f"pool_{(draw_date or 'unknown')}.csv"
+    shutil.copy2(pool_p, dest)
+    return str(dest)
 
 def get_pool_for_seed(seed_row, *, keep_permutations: bool = True) -> pd.DataFrame:
     """
@@ -76,117 +102,9 @@ def get_pool_for_seed(seed_row, *, keep_permutations: bool = True) -> pd.DataFra
             df = df.rename(columns={"Result": "combo"})
         else:
             raise RuntimeError("Pool CSV must contain 'combo' or 'Result' column.")
-    df["combo"] = (
-        df["combo"].astype(str).str.replace(r"\D", "", regex=True).str.zfill(5)
-    )
+    df["combo"] = df["combo"].astype(str).str.replace(r"\D", "", regex=True).str.zfill(5)
     df = df[df["combo"].str.fullmatch(r"\d{5}")]
     return df[["combo"]].copy()
-# ===== END OVERRIDE =====
-
-
-POOL_ARCHIVE_DIR = Path("pools")  # stores pools/pool_YYYY-MM-DD.csv
-
-def archive_today_pool(winners_csv: str = WINNERS_CSV, pool_csv: str = "today_pool.csv") -> str:
-    """
-    Copy today's pool to pools/pool_YYYY-MM-DD.csv (uses most recent date in winners CSV).
-    Returns the destination path as a string.
-    """
-    pool_p = Path(pool_csv)
-    if not pool_p.exists():
-        raise FileNotFoundError(f"Pool file not found: {pool_csv}")
-
-    dfw = pd.read_csv(winners_csv)
-    date_col = None
-    for c in dfw.columns:
-        lc = str(c).lower()
-        if lc in ("date", "drawdate", "draw_date"):
-            date_col = c
-            break
-
-    draw_date = None
-    if date_col is not None and len(dfw):
-        try:
-            draw_date = pd.to_datetime(dfw[date_col].iloc[-1], errors="coerce").date()
-        except Exception:
-            draw_date = None
-
-    POOL_ARCHIVE_DIR.mkdir(exist_ok=True)
-    dest = POOL_ARCHIVE_DIR / f"pool_{(draw_date or 'unknown')}.csv"
-    shutil.copy2(pool_p, dest)
-    return str(dest)
-
-def get_pool_for_seed(seed_row, *, keep_permutations: bool = True) -> pd.DataFrame:
-    """
-    Load the EXACT pool your app had at the pre-CSV stage for this seed's date.
-
-    Strategy:
-      1) If the seed row has a Date/DrawDate, try pools/pool_YYYY-MM-DD.csv.
-      2) Else/fallback to TODAY_POOL_CSV or repo-root today_pool.csv.
-    """
-    # Try to read the seed’s date (if present)
-    date_val = None
-    for c in getattr(seed_row, 'index', []):
-        lc = str(c).lower()
-        if lc in ("date", "drawdate", "draw_date"):
-            try:
-                date_val = pd.to_datetime(seed_row[c], errors="coerce").date()
-            except Exception:
-                date_val = None
-            break
-
-    df = None
-    # 1) Archived pool by date
-    if date_val:
-        arch = POOL_ARCHIVE_DIR / f"pool_{date_val}.csv"
-        if arch.exists():
-            df = pd.read_csv(arch)
-
-    # 2) Fallback to today's pool
-    if df is None:
-        fallback = (globals().get("TODAY_POOL_CSV") or "today_pool.csv")
-        if not Path(fallback).exists():
-            raise FileNotFoundError(
-                f"No archived pool found for {date_val} and no {fallback} present. "
-                f"Archive today’s pool (see archive_today_pool) or add pools/pool_<date>.csv."
-            )
-        df = pd.read_csv(fallback)
-
-    # Normalize to a 'combo' column of 5-digit strings
-    if "combo" not in df.columns:
-        if "Result" in df.columns:
-            df = df.rename(columns={"Result": "combo"})
-        else:
-            raise RuntimeError("Pool CSV must contain 'combo' or 'Result' column.")
-    df["combo"] = (
-        df["combo"].astype(str).str.replace(r"\D", "", regex=True).str.zfill(5)
-    )
-    df = df[df["combo"].str.fullmatch(r"\d{5}")]
-    return df[["combo"]].copy()
-
-def get_pool_for_seed(seed_row, *, keep_permutations=True):
-    """
-    Return the EXACT pool your main app has at the affinity pre-trim stage.
-    - Seed is the previous draw: seed_row["Result"]
-    - Keep permutations if your pre-trim/percentiles depend on them
-    - Do NOT apply CSV filters here
-    """
-    seed_result = str(seed_row["Result"])  # previous draw as seed
-
-    # === COPY YOUR REAL POOL-BUILD LINES HERE (from your pipeline, pre-CSV) ===
-    # Example of what this often looks like in your codebase (replace with yours):
-    # pool = enumerate_from_seed(seed_result, keep_permutations=keep_permutations)
-    # (If your pipeline applies any primary/percentile gate BEFORE CSV, do it here too)
-    # pool = primary_percentile_gate(pool)   # only if your pipeline does this pre-CSV
-    # === END COPY ===
-
-    # Ensure the DataFrame has a 'combo' column as strings
-    if "combo" not in pool.columns:
-        if "Result" in pool.columns:
-            pool = pool.rename(columns={"Result": "combo"})
-        else:
-            raise RuntimeError("Expected a 'combo' or 'Result' column in the pool DataFrame.")
-    pool["combo"] = pool["combo"].astype(str)
-    return pool
 
 # =========================
 # Helpers / domain mapping
@@ -208,7 +126,8 @@ def spread_band(spread: int) -> str:
     return "10+"
 
 def digits_of(s: str) -> List[int]:
-    return [int(ch) for ch in s]
+    s = ''.join(ch for ch in str(s) if ch.isdigit())
+    return [int(ch) for ch in s.zfill(5)[-5:]]
 
 def classify_structure(digs: List[int]) -> str:
     c = Counter(digs)
@@ -427,6 +346,34 @@ def combo_affinity(env_now: Dict[str, object], combo: str) -> float:
         W_SUM * sum_prox + W_SPD * spread_prox + W_STR * struct_match +
         W_PAR * parity_match + W_HI8 * hi8_score + W_OV1 * overlap_eq1
     )
+
+def affinity_scores_and_pct(df: pd.DataFrame, *, seed: str, weights: dict | None = None) -> pd.DataFrame:
+    """
+    Vectorized scoring wrapper so external tools (backtests/UI) can use the same affinity.
+    Returns df with columns 'aff_score' and 'aff_pct' (0..1, ascending).
+    """
+    out = df.copy()
+    if "combo" not in out.columns:
+        if "Result" in out.columns:
+            out = out.rename(columns={"Result": "combo"})
+        else:
+            raise RuntimeError("Expected 'combo' or 'Result' column.")
+    out["combo"] = out["combo"].astype(str).str.replace(r"\D", "", regex=True).str.zfill(5)
+
+    seed_d = digits_of(seed)
+    env_now = {
+        "seed_digits_list": seed_d,
+        "seed_sum": sum(seed_d),
+        "spread_seed": (max(seed_d) - min(seed_d)) if seed_d else 0,
+    }
+    scores = out["combo"].map(lambda c: combo_affinity(env_now, c)).astype(float)
+    out["aff_score"] = scores
+    vals = scores.to_numpy(float)
+    order = np.argsort(vals)
+    ranks = np.empty_like(order, dtype=float)
+    ranks[order] = np.linspace(0.0, 1.0, len(vals))
+    out["aff_pct"] = ranks
+    return out
 
 # =========================
 # Risk (history-only)
@@ -923,7 +870,8 @@ h2 { font-size: 18px; margin: 24px 0 8px; }
 __all__ = [
     "WINNERS_CSV", "FILTERS_CSV", "TODAY_POOL_CSV", "OUTPUT_DIR",
     "TARGET_MAX", "ALWAYS_KEEP_WINNER", "MINIMIZE_BEYOND_TARGET",
-    "main", "combo_affinity"
+    "main", "combo_affinity", "affinity_scores_and_pct",
+    "archive_today_pool", "get_pool_for_seed"
 ]
 
 if __name__ == "__main__":
