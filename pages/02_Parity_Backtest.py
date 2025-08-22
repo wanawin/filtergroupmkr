@@ -28,6 +28,8 @@ with col2:
     pool_mode = st.selectbox("Pool mode", ["1digit", "2digit"], index=0, help="1digit: each combo shares ≥1 distinct digit with seed. 2digit: shares ≥2.")
     pool_size = st.number_input("Pool size per day", min_value=100, max_value=20000, value=1800, step=100)
     top_pcts = st.text_input("Top % thresholds (comma)", "0.2,0.3", help="e.g., 0.2 = top 20% by affinity")
+        use_archived = st.checkbox("Use archived real pools (recommended)", value=True)
+
 
 out_prefix = "parity_affinity"
 run = st.button("▶️ Run Backtest", type="primary")
@@ -53,6 +55,9 @@ if run:
         "--top_pcts", top_pcts,
         "--out_prefix", out_prefix,
     ]
+    if use_archived:
+        cmd.append("--use_archived_pools")
+
 
     st.info("Running backtest... this analyzes historical days and writes two CSVs below.")
     with st.spinner("Working..."):
