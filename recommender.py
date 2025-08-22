@@ -370,8 +370,17 @@ def main(
     target_max: int = TARGET_MAX,
     always_keep_winner: bool = ALWAYS_KEEP_WINNER,
     minimize_beyond_target: bool = MINIMIZE_BEYOND_TARGET,
-    affinity_exclude_top_pct: Optional[float] = AFFINITY_EXCLUDE_TOP_PCT,
+    force_keep_combo: Optional[str] = None,   # <— make sure this is present
+    override_seed: Optional[str] = None,
+    override_prev: Optional[str] = None,
+    override_prevprev: Optional[str] = None,
+    max_draws: Optional[int] = None,
+    max_bucket_matches: Optional[int] = None,
+    decay_half_life: Optional[int] = None,
+    applicable_only: Optional[List[str]] = None,
+    affinity_exclude_top_pct: Optional[float] = None,
 ):
+
     winners_path = winners_csv or WINNERS_CSV
     filters_path = filters_csv or FILTERS_CSV
 
