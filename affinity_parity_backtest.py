@@ -145,6 +145,9 @@ ap.add_argument('--use_archived_pools', action='store_true',
 
     winners = load_winners(args.winners)
     N = len(winners)
+# Also keep a DataFrame view so get_pool_for_seed can read the date column
+winners_df_full = pd.read_csv(args.winners)
+
     if N < 3:
         raise SystemExit('Not enough winners to run a backtest')
 
@@ -168,9 +171,17 @@ ap.add_argument('--use_archived_pools', action='store_true',
         true_sum_par = sum_parity_label(true_digs)
         true_maj_par = parity_major_label(true_digs)
 
-        # Generate pool for the day
-        day_rng = random.Random((args.seed * 1000003) ^ t)
-        pool = gen_pool_for_seed(seed_digits, args.pool_size, args.pool_mode, day_rng)
+       # Generate/Load pool for the day
+if args.use_archived_pools:
+    import recommender as rec
+    # Use the actual seed row so get_pool_for_seed can grab the correct date
+    seed_row = winners_df_full.iloc[t-1]
+    pool_df = rec.get_pool_for_seed(seed_row)  # returns DataFrame with 'combo'
+    pool = pool_df["combo"].astype(str).tolist()
+else:
+    day_rng = random.Random((args.seed * 1000003) ^ t)
+    pool = gen_pool_for_seed(seed_digits, args.pool_size, args.pool_mode, day_rng)
+
 
         # Affinity per combo
         aff = {c: combo_affinity(env, c) for c in pool}
