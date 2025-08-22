@@ -140,6 +140,8 @@ def main():
     ap.add_argument('--out_prefix', type=str, default='parity_affinity', help='Prefix for output CSVs')
     ap.add_argument('--seed', type=int, default=12345, help='Random seed for reproducibility')
     args = ap.parse_args()
+ap.add_argument('--use_archived_pools', action='store_true',
+                help='Load real pools via recommender.get_pool_for_seed')
 
     winners = load_winners(args.winners)
     N = len(winners)
