@@ -21,6 +21,30 @@ TARGET_MAX = 44
 ALWAYS_KEEP_WINNER = True
 MINIMIZE_BEYOND_TARGET = True
 OUTPUT_DIR = Path(".")
+def get_pool_for_seed(seed_row, *, keep_permutations=True):
+    """
+    Return the EXACT pool your main app has at the affinity pre-trim stage.
+    - Seed is the previous draw: seed_row["Result"]
+    - Keep permutations if your pre-trim/percentiles depend on them
+    - Do NOT apply CSV filters here
+    """
+    seed_result = str(seed_row["Result"])  # previous draw as seed
+
+    # === COPY YOUR REAL POOL-BUILD LINES HERE (from your pipeline, pre-CSV) ===
+    # Example of what this often looks like in your codebase (replace with yours):
+    # pool = enumerate_from_seed(seed_result, keep_permutations=keep_permutations)
+    # (If your pipeline applies any primary/percentile gate BEFORE CSV, do it here too)
+    # pool = primary_percentile_gate(pool)   # only if your pipeline does this pre-CSV
+    # === END COPY ===
+
+    # Ensure the DataFrame has a 'combo' column as strings
+    if "combo" not in pool.columns:
+        if "Result" in pool.columns:
+            pool = pool.rename(columns={"Result": "combo"})
+        else:
+            raise RuntimeError("Expected a 'combo' or 'Result' column in the pool DataFrame.")
+    pool["combo"] = pool["combo"].astype(str)
+    return pool
 
 # =========================
 # Helpers / domain mapping
