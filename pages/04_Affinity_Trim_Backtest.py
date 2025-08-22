@@ -97,7 +97,19 @@ if run:
             })
             continue
 
-        scored = rec.affinity_scores_and_pct(pool_df, seed=seed)
+        # Compute affinity + percentile inline (HIGHER = MORE similar)
+        seed_s = str(seed).zfill(5)
+        seed_list = [int(ch) for ch in seed_s]
+        env_min = {
+            "seed_digits_list": seed_list,
+            "seed_sum": sum(seed_list),
+            "spread_seed": (max(seed_list) - min(seed_list)),
+        }
+        scored = pool_df[["combo"]].copy()
+        scored["combo"] = scored["combo"].astype(str).str.replace(r"\D","", regex=True).str.zfill(5)
+        scored = scored[scored["combo"].str.fullmatch(r"\d{5}")]
+        scored["aff"] = [rec.combo_affinity(env_min, c) for c in scored["combo"]]
+        scored["aff_pct"] = scored["aff"].rank(pct=True, method="average")
         n0 = len(scored)
         keep_mask = scored["aff_pct"] < (1.0 - float(top_pct))
         trimmed = scored.loc[keep_mask]
