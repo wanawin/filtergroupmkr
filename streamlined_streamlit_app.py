@@ -168,6 +168,53 @@ outputs = [
     "do_not_apply.csv",
     "one_pager.html",
 ]
+# ---------- Archetype signals (NEW) ----------
+st.markdown("---")
+st.subheader("Archetype signals")
+
+# Find newest archetype files
+arc_dist = _latest("archetype_distribution_*.csv")
+arc_risk = _latest("archetype_filter_risk_*.csv")
+
+c1, c2 = st.columns(2)
+with c1:
+    if arc_dist and arc_dist.exists():
+        st.caption(f"Archetype distribution — {arc_dist.name}")
+        try:
+            df_arc = pd.read_csv(arc_dist)
+            st.dataframe(df_arc.head(50), use_container_width=True, hide_index=True, height=400)
+            with open(arc_dist, "rb") as fh:
+                st.download_button("Download archetype_distribution CSV", fh, file_name=arc_dist.name)
+        except Exception as e:
+            st.warning(f"Could not read {arc_dist.name}: {e}")
+    else:
+        st.info("No archetype distribution file yet.")
+
+with c2:
+    if arc_risk and arc_risk.exists():
+        st.caption(f"Per-filter archetype safety — {arc_risk.name}")
+        try:
+            df_risk = pd.read_csv(arc_risk)
+            # delineate groups and show safest first inside each
+            order_buckets = ["701+", "501–700", "301–500", "101–300", "61–100", "1–60", "0"]
+            df_risk["__br"] = df_risk["group"].map({b:i for i,b in enumerate(order_buckets)}).fillna(999).astype(int)
+            df_risk = df_risk.sort_values(["__br","safe_score","elim_count","filter_id"], ascending=[True, False, False, True])
+            st.toggle("Show all", value=False, key="show_all_ar")
+            view = df_risk if st.session_state.get("show_all_ar") else df_risk.head(100)
+            st.dataframe(view.drop(columns="__br"), use_container_width=True, hide_index=True, height=520)
+            fmt = st.radio("Download format", ["CSV","TXT"], horizontal=True, key="dl_ar_fmt")
+            if fmt == "CSV":
+                with open(arc_risk, "rb") as fh:
+                    st.download_button("Download archetype_filter_risk CSV", fh, file_name=arc_risk.name)
+            else:
+                # text list of filter_ids in order
+                txt = "\n".join(view["filter_id"].astype(str).tolist())
+                st.download_button("Download visible list (TXT)", data=txt.encode("utf-8"), file_name="archetype_filters_visible.txt")
+        except Exception as e:
+            st.warning(f"Could not read {arc_risk.name}: {e}")
+    else:
+        st.info("No per-filter archetype safety file yet.")
+
 for fname in outputs:
     p = OUT_DIR / fname
     if p.exists():
