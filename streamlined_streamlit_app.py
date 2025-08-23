@@ -32,7 +32,7 @@ def _exists_info(path_str: str):
     p = Path(path_str)
     return p.exists(), p
 
-# --- NEW: helper to find the newest file matching a glob ---
+# --- helper to find the newest file matching a glob ---
 def _latest(path_glob: str) -> Path | None:
     files = list(Path(".").glob(path_glob))
     if not files:
@@ -179,9 +179,9 @@ if submitted:
                             except Exception:
                                 st.code(p.read_text(encoding='utf-8')[:5000])
 
-                # --- NEW: render the compounded Final Ordered SafeList inline + download choice ---
+                # --- Final Ordered SafeList — Sequence-first (existing compounded list) ---
                 st.markdown("---")
-                st.subheader("Final Ordered SafeList (compounded)")
+                st.subheader("Final Ordered SafeList — Sequence-first")
                 latest_csv  = _latest("final_safe_ordered_*.csv")
                 latest_txt  = _latest("final_safe_ordered_*.txt")
                 latest_html = _latest("final_safe_ordered_*.html")
@@ -189,7 +189,7 @@ if submitted:
                 if latest_csv and latest_csv.exists():
                     try:
                         df_final = pd.read_csv(latest_csv)
-                        show_all = st.toggle("Show all rows", value=False)
+                        show_all = st.toggle("Show all rows (sequence-first)", value=False)
                         if show_all:
                             st.dataframe(
                                 df_final,
@@ -206,7 +206,7 @@ if submitted:
                                 height=700
                             )
 
-                        fmt = st.radio("Download format", ["CSV", "TXT", "HTML"], horizontal=True)
+                        fmt = st.radio("Download format (sequence-first)", ["CSV", "TXT", "HTML"], horizontal=True)
                         selected_path = {
                             "CSV": latest_csv,
                             "TXT": latest_txt if latest_txt and latest_txt.exists() else latest_csv,
@@ -215,7 +215,7 @@ if submitted:
                         mime = "text/csv" if fmt == "CSV" else "text/plain" if fmt == "TXT" else "text/html"
                         with open(selected_path, "rb") as fh:
                             st.download_button(
-                                f"Download Final SafeList ({fmt})",
+                                f"Download Final SafeList — Sequence-first ({fmt})",
                                 data=fh,
                                 file_name=selected_path.name,
                                 mime=mime,
@@ -226,10 +226,62 @@ if submitted:
                             + (f", {latest_txt.name}" if latest_txt else "")
                             + (f", {latest_html.name}" if latest_html else "")
                         )
-                    except Exception as e:
+                    except Exception:
                         st.info("Final SafeList files were written, but couldn’t render the table here.")
                 else:
-                    st.info("No Final Ordered SafeList found yet. Make sure do_not_apply.csv and avoid_pairs.csv were present when the recommender ran.")
+                    st.info("No Sequence-first list found yet. Make sure do_not_apply.csv and avoid_pairs.csv were present when the recommender ran.")
+
+                # --- Final Ordered SafeList — Safest-first (NEW) ---
+                st.markdown("---")
+                st.subheader("Final Ordered SafeList — Safest-first")
+                latest_csv2  = _latest("final_safe_safest_first_*.csv")
+                latest_txt2  = _latest("final_safe_safest_first_*.txt")
+                latest_html2 = _latest("final_safe_safest_first_*.html")
+
+                if latest_csv2 and latest_csv2.exists():
+                    try:
+                        df_final2 = pd.read_csv(latest_csv2)
+                        show_all2 = st.toggle("Show all rows (safest-first)", value=False)
+                        if show_all2:
+                            st.dataframe(
+                                df_final2,
+                                use_container_width=True,
+                                hide_index=True,
+                                height=min(700, 40 + 28 * len(df_final2))
+                            )
+                        else:
+                            st.caption("Showing first 100 rows (toggle above to show everything).")
+                            st.dataframe(
+                                df_final2.head(100),
+                                use_container_width=True,
+                                hide_index=True,
+                                height=700
+                            )
+
+                        fmt2 = st.radio("Download format (safest-first)", ["CSV", "TXT", "HTML"], horizontal=True)
+                        selected2 = {
+                            "CSV": latest_csv2,
+                            "TXT": latest_txt2 if latest_txt2 and latest_txt2.exists() else latest_csv2,
+                            "HTML": latest_html2 if latest_html2 and latest_html2.exists() else latest_csv2,
+                        }[fmt2]
+                        mime2 = "text/csv" if fmt2 == "CSV" else "text/plain" if fmt2 == "TXT" else "text/html"
+                        with open(selected2, "rb") as fh2:
+                            st.download_button(
+                                f"Download Final SafeList — Safest-first ({fmt2})",
+                                data=fh2,
+                                file_name=selected2.name,
+                                mime=mime2,
+                                type="primary",
+                            )
+                        st.caption(
+                            f"Files: {latest_csv2.name}"
+                            + (f", {latest_txt2.name}" if latest_txt2 else "")
+                            + (f", {latest_html2.name}" if latest_html2 else "")
+                        )
+                    except Exception:
+                        st.info("Safest-first files were written, but couldn’t render the table here.")
+                else:
+                    st.info("No Safest-first list found yet. Run the recommender first.")
 
             except Exception as e:
                 st.exception(e)
