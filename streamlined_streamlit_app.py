@@ -125,6 +125,26 @@ if submitted:
             try:
                 result = run_recommender(**kwargs)
                 st.success("✅ Recommender finished")
+                from pathlib import Path
+import pandas as pd
+st.success("Recommender finished")
+
+p = Path("NoPool_today_pairs_TOP.csv")
+if p.exists():
+    try:
+        df = pd.read_csv(p)
+        if df.empty:
+            st.info("No additional NoPool recommendations today "
+                    "(min_days=60, min_keep=75%). "
+                    "See one_pager.html for details.")
+        else:
+            st.success(f"NoPool recommendations ready: {len(df)} pair(s). "
+                       "Open one_pager.html for details.")
+    except Exception:
+        st.warning("NoPool summary file not readable. Check logs / one_pager.html.")
+else:
+    st.info("NoPool summary file not found. (Feature may be disabled or no pairs applied.)")
+
                 # show sequence if written; otherwise show returned structure
                 if isinstance(result, (list, tuple, dict)):
                     st.dataframe(pd.DataFrame(result))
