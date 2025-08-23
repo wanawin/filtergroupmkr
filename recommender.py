@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import math, html, itertools as it
 from dataclasses import dataclass
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
@@ -18,7 +18,7 @@ FILTERS_CSV = "lottery_filters_batch_10.csv"
 TODAY_POOL_CSV: Optional[str] = None
 
 TARGET_MAX = 44
-# NOTE: kept for compatibility, but the app NEVER guards the winner now.
+# Prediction/backtest mode — never guard the (unknown) winner
 ALWAYS_KEEP_WINNER = False
 MINIMIZE_BEYOND_TARGET = True
 OUTPUT_DIR = Path(".")
@@ -31,22 +31,15 @@ POOL_ARCHIVE_DIR = Path("pools")
 
 # --- NoPool integration knobs (historical signals; no simulated pool) ---
 INCLUDE_NOPOOL_PANEL = True
-NOPOOL_MIN_DAYS      = 60       # require both-applicable on ≥ this many days
-NOPOOL_MIN_KEEP      = 75.0     # show pairs with winner-kept ≥ this %
-NOPOOL_PARITY_SKEW   = 10.0     # show parity only if abs(50 - even%) ≥ this
-NOPOOL_MAX_ROWS      = 20       # how many pairs to list in the panel
+NOPOOL_MIN_DAYS      = 60
+NOPOOL_MIN_KEEP      = 75.0
+NOPOOL_PARITY_SKEW   = 10.0
+NOPOOL_MAX_ROWS      = 20
 
 # =============================================================================
 # Pool archive helpers
 # =============================================================================
 def get_pool_for_seed(seed_row: pd.Series, *, keep_permutations: bool = True) -> pd.DataFrame:
-    """
-    Load the EXACT pool your app had at the pre-CSV stage for this seed's date.
-    Strategy:
-      1) If seed_row has a Date/DrawDate, try pools/pool_YYYY-MM-DD.csv
-      2) Else/fallback to TODAY_POOL_CSV or repo-root today_pool.csv
-    Returns a DataFrame with a 'combo' column of 5-digit strings.
-    """
     date_val = None
     for c in getattr(seed_row, "index", []):
         lc = str(c).lower()
@@ -359,7 +352,7 @@ def apply_filter_to_pool(f: FilterDef, base_env: Dict[str,object], pool: List[st
     return keep, elim
 
 # =============================================================================
-# Archetype stats (NEW)
+# Archetype stats (ALWAYS writes CSVs)
 # =============================================================================
 def _combo_has_dupe(digs: List[int]) -> int:
     return 1 if max(Counter(digs).values()) >= 2 else 0
@@ -374,23 +367,31 @@ def archetype_stats_today_applicable(
     filters_all: Dict[str, FilterDef],
     idx_now: int,
 ) -> Dict[str, str]:
-    """
-    For today's applicable filters only, compute historical winner-kept% by:
-      - Single features: seedOverlap, dupe, parMaj, LHmix, sum
-      - All feature PAIRS among those 5
-      - Three fixed 3-feature clusters (C1, C2, C3)
-    Writes three CSVs and returns their paths.
-    """
     N = idx_now
-    if N < 2:
-        return {}
+    # Output paths up-front
+    p_single = OUTPUT_DIR / "archetypes_single.csv"
+    p_pair   = OUTPUT_DIR / "archetypes_pairs.csv"
+    p_triple = OUTPUT_DIR / "archetypes_triples.csv"
 
-    # Build envs for history days 1..idx_now
+    # Prepare empty shells so files always exist
+    df_empty_single = pd.DataFrame(columns=["feature","value","filter_id","days_applicable","winner_kept","winner_kept_pct"])
+    df_empty_pair   = pd.DataFrame(columns=["feature_a","value_a","feature_b","value_b","filter_id","days_applicable","winner_kept","winner_kept_pct"])
+    df_empty_triple = pd.DataFrame(columns=["cluster","key","filter_id","days_applicable","winner_kept","winner_kept_pct"])
+
+    if N < 2:
+        df_empty_single.to_csv(p_single, index=False)
+        df_empty_pair.to_csv(p_pair, index=False)
+        df_empty_triple.to_csv(p_triple, index=False)
+        return {"single": str(p_single), "pairs": str(p_pair), "triples": str(p_triple)}
+
     envs = [build_env_for_draw(i, winners) for i in range(1, idx_now+1)]
     env_now = envs[-1]
     todays_ids = [fid for fid, f in filters_all.items() if safe_eval(f.applicable_if, env_now)]
     if not todays_ids:
-        return {}
+        df_empty_single.to_csv(p_single, index=False)
+        df_empty_pair.to_csv(p_pair, index=False)
+        df_empty_triple.to_csv(p_triple, index=False)
+        return {"single": str(p_single), "pairs": str(p_pair), "triples": str(p_triple)}
 
     # Compile expressions for today's set only
     f_slice = {fid: filters_all[fid] for fid in todays_ids}
@@ -406,7 +407,7 @@ def archetype_stats_today_applicable(
     app = np.zeros((N, F), dtype=bool)
     blk = np.zeros((N, F), dtype=bool)
 
-    # Precompute applicability & blocking across history
+    # Applicability/blocking over history
     for i, env in enumerate(envs):
         for fid in todays_ids:
             j = idx_map[fid]
@@ -422,7 +423,7 @@ def archetype_stats_today_applicable(
                     b = False
                 blk[i, j] = b
 
-    # Feature extraction per day
+    # Feature extraction
     def features_for_env(env: Dict[str, object]):
         digs = env["combo_digits_list"]
         seedd = env["seed_digits_list"]
@@ -435,11 +436,9 @@ def archetype_stats_today_applicable(
         }
         return feats
 
-    # Accumulators
-    from collections import defaultdict
-    single_counts = defaultdict(lambda: [0,0])  # (feature, value, fid) -> [app, kept]
-    pair_counts   = defaultdict(lambda: [0,0])  # (fa,va, fb,vb, fid)
-    triple_counts = defaultdict(lambda: [0,0])  # (cluster, key, fid)
+    single_counts = defaultdict(lambda: [0,0])
+    pair_counts   = defaultdict(lambda: [0,0])
+    triple_counts = defaultdict(lambda: [0,0])
 
     single_names = ["seedOverlap", "dupe", "parMaj", "LHmix", "sum"]
     pair_names = list(it.combinations(single_names, 2))
@@ -451,7 +450,6 @@ def archetype_stats_today_applicable(
 
     for i, env in enumerate(envs):
         feats = features_for_env(env)
-        # build pair values for this day
         pair_vals = {p: (feats[p[0]], feats[p[1]]) for p in pair_names}
         triple_vals = {}
         for cname, trio in triple_clusters:
@@ -482,62 +480,61 @@ def archetype_stats_today_applicable(
                 triple_counts[kt][0] += 1
                 triple_counts[kt][1] += int(kept)
 
-    # Build DataFrames
-    def to_df_single():
-        recs = []
-        for (feat, val, fid), (n, k) in single_counts.items():
-            if n == 0: continue
-            recs.append({
-                "feature": feat, "value": val, "filter_id": fid,
-                "days_applicable": n, "winner_kept": k,
-                "winner_kept_pct": round(100.0 * k / n, 3)
-            })
-        df = pd.DataFrame(recs)
-        if not df.empty:
-            df = df.sort_values(["winner_kept_pct","days_applicable","feature","value","filter_id"],
-                                ascending=[False, False, True, True, True])
-        return df
+    # Build DataFrames (write even if empty)
+    recs = []
+    for (feat, val, fid), (n, k) in single_counts.items():
+        if n == 0: continue
+        recs.append({
+            "feature": feat, "value": val, "filter_id": fid,
+            "days_applicable": n, "winner_kept": k,
+            "winner_kept_pct": round(100.0 * k / n, 3)
+        })
+    df_single = pd.DataFrame(recs, columns=df_empty_single.columns)
+    if not df_single.empty:
+        df_single = df_single.sort_values(
+            ["winner_kept_pct","days_applicable","feature","value","filter_id"],
+            ascending=[False, False, True, True, True]
+        )
+    else:
+        df_single = df_empty_single.copy()
+    df_single.to_csv(p_single, index=False)
 
-    def to_df_pair():
-        recs = []
-        for (fa, va, fb, vb, fid), (n, k) in pair_counts.items():
-            if n == 0: continue
-            recs.append({
-                "feature_a": fa, "value_a": va, "feature_b": fb, "value_b": vb,
-                "filter_id": fid, "days_applicable": n, "winner_kept": k,
-                "winner_kept_pct": round(100.0 * k / n, 3)
-            })
-        df = pd.DataFrame(recs)
-        if not df.empty:
-            df = df.sort_values(["winner_kept_pct","days_applicable","feature_a","feature_b","filter_id"],
-                                ascending=[False, False, True, True, True])
-        return df
+    recs = []
+    for (fa, va, fb, vb, fid), (n, k) in pair_counts.items():
+        if n == 0: continue
+        recs.append({
+            "feature_a": fa, "value_a": va, "feature_b": fb, "value_b": vb,
+            "filter_id": fid, "days_applicable": n, "winner_kept": k,
+            "winner_kept_pct": round(100.0 * k / n, 3)
+        })
+    df_pair = pd.DataFrame(recs, columns=df_empty_pair.columns)
+    if not df_pair.empty:
+        df_pair = df_pair.sort_values(
+            ["winner_kept_pct","days_applicable","feature_a","feature_b","filter_id"],
+            ascending=[False, False, True, True, True]
+        )
+    else:
+        df_pair = df_empty_pair.copy()
+    df_pair.to_csv(p_pair, index=False)
 
-    def to_df_triple():
-        recs = []
-        for (cluster, key, fid), (n, k) in triple_counts.items():
-            if n == 0: continue
-            recs.append({
-                "cluster": cluster, "key": key, "filter_id": fid,
-                "days_applicable": n, "winner_kept": k,
-                "winner_kept_pct": round(100.0 * k / n, 3)
-            })
-        df = pd.DataFrame(recs)
-        if not df.empty:
-            df = df.sort_values(["cluster","winner_kept_pct","days_applicable","filter_id"],
-                                ascending=[True, False, False, True])
-        return df
+    recs = []
+    for (cluster, key, fid), (n, k) in triple_counts.items():
+        if n == 0: continue
+        recs.append({
+            "cluster": cluster, "key": key, "filter_id": fid,
+            "days_applicable": n, "winner_kept": k,
+            "winner_kept_pct": round(100.0 * k / n, 3)
+        })
+    df_triple = pd.DataFrame(recs, columns=df_empty_triple.columns)
+    if not df_triple.empty:
+        df_triple = df_triple.sort_values(
+            ["cluster","winner_kept_pct","days_applicable","filter_id"],
+            ascending=[True, False, False, True]
+        )
+    else:
+        df_triple = df_empty_triple.copy()
+    df_triple.to_csv(p_triple, index=False)
 
-    df_single = to_df_single()
-    df_pair   = to_df_pair()
-    df_triple = to_df_triple()
-
-    p_single = OUTPUT_DIR / "archetypes_single.csv"
-    p_pair   = OUTPUT_DIR / "archetypes_pairs.csv"
-    p_triple = OUTPUT_DIR / "archetypes_triples.csv"
-    if df_single is not None: df_single.to_csv(p_single, index=False)
-    if df_pair is not None:   df_pair.to_csv(p_pair, index=False)
-    if df_triple is not None: df_triple.to_csv(p_triple, index=False)
     return {"single": str(p_single), "pairs": str(p_pair), "triples": str(p_triple)}
 
 # =============================================================================
@@ -561,7 +558,6 @@ def nopool_today_pairs(
     if len(todays_ids) < 2:
         return pd.DataFrame()
 
-    # Precompile just today's set
     f_slice = {fid: filters_all[fid] for fid in todays_ids}
     comp_app, comp_blk = {}, {}
     for fid, f in f_slice.items():
@@ -596,9 +592,8 @@ def nopool_today_pairs(
     for a_idx in range(F):
         for b_idx in range(a_idx+1, F):
             mask = app[:, a_idx] & app[:, b_idx]
-            n = int(mask.sum())
-            if n == 0: 
-                continue
+            n = int(mask.sum()); 
+            if n == 0: continue
             either_blocks = int(((blk[:, a_idx] | blk[:, b_idx]) & mask).sum())
             both_blocks  = int(((blk[:, a_idx] & blk[:, b_idx]) & mask).sum())
             kept_rate = (1 - (either_blocks / n)) * 100.0
@@ -742,7 +737,7 @@ def build_final_ordered_safelist(
 def build_final_safest_first_safelist(
     safe_source_path: str | Path = "do_not_apply.csv",
     avoid_pairs_path: str | Path = "avoid_pairs.csv",
-    seq_path: str | Path = "recommender_sequence.csv",  # optional for elim tiebreak
+    seq_path: str | Path = "recommender_sequence.csv",
     out_basename: str = "final_safe_safest_first",
 ) -> Optional[Dict[str, object]]:
     safe_source_path  = Path(safe_source_path)
@@ -938,14 +933,14 @@ def main(
     filters_csv: Optional[str] = None,
     today_pool_csv: Optional[str] = None,
     target_max: int = TARGET_MAX,
-    always_keep_winner: bool = ALWAYS_KEEP_WINNER,  # ignored, kept for CLI compat
+    always_keep_winner: bool = ALWAYS_KEEP_WINNER,  # unused, for CLI compat
     minimize_beyond_target: bool = MINIMIZE_BEYOND_TARGET,
-    force_keep_combo: Optional[str] = None,  # ignored, kept for CLI compat
-    override_seed: Optional[str] = None,     # ignored in prediction mode
-    override_prev: Optional[str] = None,     # ignored in prediction mode
-    override_prevprev: Optional[str] = None, # ignored in prediction mode
+    force_keep_combo: Optional[str] = None,
+    override_seed: Optional[str] = None,
+    override_prev: Optional[str] = None,
+    override_prevprev: Optional[str] = None,
     max_draws: Optional[int] = None,
-    max_bucket_matches: Optional[int] = None,  # unused but kept for compat
+    max_bucket_matches: Optional[int] = None,
     decay_half_life: Optional[int] = None,
     applicable_only: Optional[List[str]] = None,
     affinity_exclude_top_pct: Optional[float] = None,
@@ -975,7 +970,7 @@ def main(
         apply_set = {fid.strip() for fid in applicable_only}
         applicable = {fid: f for fid, f in applicable.items() if fid in apply_set}
 
-    # Historical risk for ranking order (on history, not pool)
+    # Historical risk / support (history-based)
     single_fail, pair_risk, idx_used = historical_risk_for_applicable(
         list(applicable.values()), winners, idx_now,
         max_draws=max_draws, max_bucket_matches=max_bucket_matches,
@@ -1008,7 +1003,7 @@ def main(
     remaining = len(pool)
     seq_rows = []  # step log
 
-    # ===== Anti-affinity pre-trim (drop top X% most seed-like) =====
+    # ===== Anti-affinity pre-trim =====
     pct = AFFINITY_EXCLUDE_TOP_PCT if affinity_exclude_top_pct is None else float(affinity_exclude_top_pct)
     if pool and (0.0 < pct < 1.0):
         aff = np.array([combo_affinity(env_now, c) for c in pool], dtype=float)
@@ -1029,7 +1024,7 @@ def main(
             "skipped_reason": None,
         })
 
-    # ===== Pair conflicts (for "avoid pairs" table) =====
+    # ===== Pair conflicts (avoid_pairs.csv) =====
     avoid_rows = []
     for a, b in it.combinations(sorted(applicable.keys()), 2):
         pr = pair_risk.get((a,b)) or pair_risk.get((b,a)) or 0.0
@@ -1053,7 +1048,7 @@ def main(
         ["pair_risk","co_applicable_n"], ascending=[False,False]
     ).to_csv(OUTPUT_DIR / "avoid_pairs.csv", index=False)
 
-    # ===== Apply filters in order (pure prediction/backtest mode) =====
+    # ===== Apply filters (prediction/backtest) =====
     base_env = env_now
     final_pool = pool[:] if pool else None
 
@@ -1086,7 +1081,7 @@ def main(
             OUTPUT_DIR / "pool_reduction_log.csv", index=False
         )
 
-    # ===== Tier list (quick “do not apply” summary) =====
+    # ===== Tier list =====
     rows = []
     for fid, f in applicable.items():
         risk = float((single_fail.get(fid, 0.0)))
@@ -1105,10 +1100,10 @@ def main(
         )
         do_not_df.to_csv(OUTPUT_DIR / "do_not_apply.csv", index=False)
 
-    # ===== Archetype CSVs (NEW) =====
-    _ = archetype_stats_today_applicable(winners, filters_map, idx_now)
+    # ===== Archetype CSVs (ALWAYS written) =====
+    arche_paths = archetype_stats_today_applicable(winners, filters_map, idx_now)
 
-    # ===== NoPool panel (today’s historically safe pairs) =====
+    # ===== NoPool panel (optional) =====
     if include_nopool_panel:
         _ = nopool_today_pairs(
             winners, filters_map, idx_now,
@@ -1118,29 +1113,7 @@ def main(
             max_rows=NOPOOL_MAX_ROWS,
         )
 
-    # ===== Build the three SafeLists =====
-    _ = build_final_ordered_safelist(
-        safe_source_path=OUTPUT_DIR / "do_not_apply.csv",
-        avoid_pairs_path=OUTPUT_DIR / "avoid_pairs.csv",
-        seq_path=OUTPUT_DIR / "recommender_sequence.csv",
-        out_basename="final_safe_ordered",
-    )
-    _ = build_final_safest_first_safelist(
-        safe_source_path=OUTPUT_DIR / "do_not_apply.csv",
-        avoid_pairs_path=OUTPUT_DIR / "avoid_pairs.csv",
-        seq_path=OUTPUT_DIR / "recommender_sequence.csv",
-        out_basename="final_safe_safest_first",
-    )
-    _ = build_final_grouped_by_aggression_on_pool(
-        filters_map=filters_map,
-        base_env=base_env,
-        base_pool=(pool[:] if pool else []),
-        safe_source_path=OUTPUT_DIR / "do_not_apply.csv",
-        avoid_pairs_path=OUTPUT_DIR / "avoid_pairs.csv",
-        out_basename="final_safe_grouped",
-    )
-
-    # ===== One-pager (tiny snapshot) =====
+    # ===== One-pager (tiny snapshot + archetype file names) =====
     seed_list = base_env['seed_digits_list']
     parity_major = "even>=3" if sum(1 for d in seed_list if d%2==0) >= 3 else "even<=2"
 
@@ -1168,7 +1141,7 @@ h2 { font-size: 18px; margin: 24px 0 8px; }
         "<div style='margin-top:8px'><span class='kpi'>Anti-affinity default: drop top {}%</span></div>"
         "<div style='margin-top:8px'><span class='kpi'>Applicable filters: {}</span>"
         "<span class='kpi'>Final size: {}</span></div>"
-        "<div style='margin-top:8px' class='mono'>Archetype CSVs: archetypes_single.csv, archetypes_pairs.csv, archetypes_triples.csv</div>"
+        "<div style='margin-top:8px' class='mono'>Archetype CSVs: {}</div>"
         "</div>"
     ).format(
         html.escape(str(base_env['seed'])),
@@ -1177,7 +1150,8 @@ h2 { font-size: 18px; margin: 24px 0 8px; }
         base_env['spread_seed'], parity_major,
         int(round(pct*100)),
         len(applicable),
-        remaining if remaining is not None else "—"
+        remaining if remaining is not None else "—",
+        ", ".join([Path(v).name for v in arche_paths.values()]) if arche_paths else "archetypes_single.csv, archetypes_pairs.csv, archetypes_triples.csv"
     )
 
     def df_to_html_table(df: pd.DataFrame, columns: list, empty_msg: str, limit: int = None):
