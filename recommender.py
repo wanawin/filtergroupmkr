@@ -1,4 +1,4 @@
-# recommender.py — winner-prediction filter recommendations (no winner guard)
+# recommender.py — winner-prediction filter recommendations with anti-affinity pre-trim
 from __future__ import annotations
 
 import math, html, itertools as it
@@ -18,7 +18,7 @@ FILTERS_CSV = "lottery_filters_batch_10.csv"
 TODAY_POOL_CSV: Optional[str] = None
 
 TARGET_MAX = 44
-ALWAYS_KEEP_WINNER = False  # <- do not protect historical winners (backtest-friendly)
+ALWAYS_KEEP_WINNER = True
 MINIMIZE_BEYOND_TARGET = True
 OUTPUT_DIR = Path(".")
 
@@ -30,10 +30,10 @@ POOL_ARCHIVE_DIR = Path("pools")
 
 # --- NoPool integration knobs (historical signals; no simulated pool) ---
 INCLUDE_NOPOOL_PANEL = True
-NOPOOL_MIN_DAYS    = 60       # require both-applicable on ≥ this many days
-NOPOOL_MIN_KEEP    = 75.0     # show pairs with winner-kept ≥ this %
-NOPOOL_PARITY_SKEW = 10.0     # show parity only if abs(50 - even%) ≥ this
-NOPOOL_MAX_ROWS    = 20       # how many pairs to list in the panel
+NOPOOL_MIN_DAYS      = 60       # require both-applicable on ≥ this many days
+NOPOOL_MIN_KEEP      = 75.0     # show pairs with winner-kept ≥ this %
+NOPOOL_PARITY_SKEW   = 10.0     # show parity only if abs(50 - even%) ≥ this
+NOPOOL_MAX_ROWS      = 20       # how many pairs to list in the panel
 
 # =============================================================================
 # Pool archive helpers
@@ -106,7 +106,6 @@ def spread_band(spread: int) -> str:
     return "10+"
 
 def hot_cold_due(history: List[List[int]], k_hotcold: int = 10):
-    """Top-level (global) helper — was missing/indented before."""
     flat = [d for row in history[-k_hotcold:] for d in row]
     cnt = Counter(flat)
     hot, cold = set(), set()
@@ -376,10 +375,6 @@ def nopool_today_pairs(
     parity_skew: float = NOPOOL_PARITY_SKEW,
     max_rows: int = NOPOOL_MAX_ROWS,
 ) -> pd.DataFrame:
-    """
-    Compute historical stats for PAIRS drawn ONLY from today's applicable filters.
-    Fast, no simulated pools. Returns a dataframe with plain-English columns.
-    """
     N = idx_now
     if N < 2:
         return pd.DataFrame()
@@ -423,9 +418,8 @@ def nopool_today_pairs(
     for a_idx in range(F):
         for b_idx in range(a_idx+1, F):
             mask = app[:, a_idx] & app[:, b_idx]
-            n = int(mask.sum())
-            if n == 0:
-                continue
+            n = int(mask.sum()); 
+            if n == 0: continue
             either_blocks = int(((blk[:, a_idx] | blk[:, b_idx]) & mask).sum())
             both_blocks  = int(((blk[:, a_idx] & blk[:, b_idx]) & mask).sum())
             kept_rate = (1 - (either_blocks / n)) * 100.0
@@ -436,9 +430,7 @@ def nopool_today_pairs(
                 parity_note = f"{tip} skew: {even_rate:.1f}%"
             recs.append({
                 "Filter A ID": todays_ids[a_idx],
-                "Filter A Name": f_slice[todays_ids[a_idx]].name,
                 "Filter B ID": todays_ids[b_idx],
-                "Filter B Name": f_slice[todays_ids[b_idx]].name,
                 "Days both applicable (history)": n,
                 "Winner kept % (both applicable)": round(kept_rate, 3),
                 "Either blocks winner %": round((either_blocks/n)*100.0, 3),
@@ -452,48 +444,21 @@ def nopool_today_pairs(
         ["Winner kept % (both applicable)", "Days both applicable (history)"],
         ascending=[False, False]
     )
+    df_all = df.copy()
     df_viable = df[(df["Days both applicable (history)"] >= int(min_days)) &
                    (df["Winner kept % (both applicable)"] >= float(min_keep))].copy()
-    df.to_csv(OUTPUT_DIR / "NoPool_today_pairs_ALL.csv", index=False)
+    df_all.to_csv(OUTPUT_DIR / "NoPool_today_pairs_ALL.csv", index=False)
     df_viable.head(max_rows).to_csv(OUTPUT_DIR / "NoPool_today_pairs_TOP.csv", index=False)
     return df_viable.head(max_rows)
 
 # =============================================================================
-# Final Ordered SafeList builders
+# Final SafeList builders
 # =============================================================================
 def _detect_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     for c in candidates:
         if c in df.columns:
             return c
     return None
-
-def _revised_safe_ids(
-    safe_source_path: Path,
-    avoid_pairs_path: Path
-) -> Tuple[List[str], pd.DataFrame]:
-    """Helper: SAFE-only from do_not_apply.csv minus anything seen in avoid_pairs.csv."""
-    safe_df = pd.read_csv(safe_source_path)
-    tier_col = _detect_col(safe_df, ["tier", "Tier", "TIER"])
-    fid_col  = _detect_col(safe_df, ["filter_id", "Filter ID", "FILTER_ID", "fid", "FID", "id"])
-    if not tier_col or not fid_col:
-        return [], pd.DataFrame()
-    safe_df[fid_col] = safe_df[fid_col].astype(str).str.strip()
-    safe_only = safe_df[safe_df[tier_col].astype(str).str.upper() == "SAFE"].copy()
-
-    ap_df = pd.read_csv(avoid_pairs_path)
-    fid1 = _detect_col(ap_df, ["filter_id_1", "FID1", "fid1"])
-    fid2 = _detect_col(ap_df, ["filter_id_2", "FID2", "fid2"])
-    ap_ids = set()
-    if fid1 and fid2:
-        ap_ids = set(ap_df[fid1].astype(str).str.strip()) | set(ap_df[fid2].astype(str).str.strip())
-
-    metrics = (
-        safe_only.rename(columns={fid_col: "filter_id"})
-        .drop_duplicates("filter_id")
-        .set_index("filter_id")
-    )
-    revised = [fid for fid in set(metrics.index) if fid not in ap_ids]
-    return revised, metrics
 
 def build_final_ordered_safelist(
     safe_source_path: str | Path = "do_not_apply.csv",
@@ -502,14 +467,8 @@ def build_final_ordered_safelist(
     out_basename: str = "final_safe_ordered",
 ) -> Optional[Dict[str, object]]:
     """
-    Spec:
-      1) Take ONLY the SAFE rows from do_not_apply.csv
-      2) Remove any filter that appears even once in avoid_pairs.csv (either column)
-      3) Reorder this REVISED safelist using recommender_sequence.csv order
-         (do NOT drop anything from the revised safelist).
-         Items not present in the sequence go to the bottom, sorted by aggressiveness:
-           priority: eliminations (from sequence) -> support -> risk (from do_not_apply.csv)
-      4) Emit CSV, TXT, HTML and return metadata
+    SAFE only (from do_not_apply.csv) → drop anything seen in avoid_pairs.csv → 
+    order by recommender_sequence.csv (keep all revised safelist items).
     """
     safe_source_path  = Path(safe_source_path)
     avoid_pairs_path  = Path(avoid_pairs_path)
@@ -517,12 +476,30 @@ def build_final_ordered_safelist(
     if not safe_source_path.exists() or not avoid_pairs_path.exists():
         return None
 
-    revised_safe_ids, metrics = _revised_safe_ids(safe_source_path, avoid_pairs_path)
-    if len(revised_safe_ids) == 0:
+    safe_df = pd.read_csv(safe_source_path)
+    tier_col = _detect_col(safe_df, ["tier", "Tier", "TIER"])
+    fid_col  = _detect_col(safe_df, ["filter_id", "Filter ID", "FILTER_ID", "fid", "FID", "id"])
+    if not tier_col or not fid_col:
         return None
+    safe_df[fid_col] = safe_df[fid_col].astype(str).str.strip()
+    safe_only = safe_df[safe_df[tier_col].astype(str).str.upper() == "SAFE"].copy()
+    safe_ids = set(safe_only[fid_col])
 
-    in_seq_order: List[str] = []
-    remaining: List[str] = list(revised_safe_ids)
+    metrics = (
+        safe_only.rename(columns={fid_col: "filter_id"})
+        .drop_duplicates("filter_id")
+        .set_index("filter_id")
+    )
+
+    ap_df = pd.read_csv(avoid_pairs_path)
+    fid1 = _detect_col(ap_df, ["filter_id_1", "FID1", "fid1"])
+    fid2 = _detect_col(ap_df, ["filter_id_2", "FID2", "fid2"])
+    if not fid1 or not fid2:
+        return None
+    ap_ids = set(ap_df[fid1].astype(str).str.strip()) | set(ap_df[fid2].astype(str).str.strip())
+    revised_safe_ids = [fid for fid in safe_ids if fid not in ap_ids]
+
+    in_seq_order, not_in_seq = [], []
     elim_map: Dict[str, float] = {}
 
     if seq_path.exists():
@@ -533,12 +510,16 @@ def build_final_ordered_safelist(
             seq_order = seq_df[seq_fid].tolist()
             elim_col = _detect_col(seq_df, ["eliminated_now", "eliminations", "elim_count", "elimination_count", "elims"])
             if elim_col:
-                elim_map = dict(zip(
-                    seq_df[seq_fid],
-                    pd.to_numeric(seq_df[elim_col], errors="coerce").fillna(0.0)
-                ))
+                try:
+                    elim_map = dict(zip(seq_df[seq_fid], pd.to_numeric(seq_df[elim_col], errors="coerce").fillna(0)))
+                except Exception:
+                    elim_map = {}
             in_seq_order = [fid for fid in seq_order if fid in revised_safe_ids]
             remaining = [fid for fid in revised_safe_ids if fid not in set(in_seq_order)]
+        else:
+            remaining = list(revised_safe_ids)
+    else:
+        remaining = list(revised_safe_ids)
 
     def aggression(fid: str) -> float:
         if fid in elim_map:
@@ -574,27 +555,23 @@ def build_final_ordered_safelist(
 
     return {
         "counts": {
+            "safe_only": len(safe_ids),
             "revised_safe": len(revised_safe_ids),
             "in_sequence": len(in_seq_order),
             "not_in_sequence": len(not_in_seq),
             "final_total": len(final_ids),
         },
         "outputs": {"csv": str(out_csv), "txt": str(out_txt), "html": str(out_html)},
-        "order_mode": "sequence_biased",
     }
 
 def build_final_safest_first_safelist(
     safe_source_path: str | Path = "do_not_apply.csv",
     avoid_pairs_path: str | Path = "avoid_pairs.csv",
-    seq_path: str | Path = "recommender_sequence.csv",  # optional tiebreaker
+    seq_path: str | Path = "recommender_sequence.csv",  # optional for elim tiebreak
     out_basename: str = "final_safe_safest_first",
 ) -> Optional[Dict[str, object]]:
     """
-    SAFEST-FIRST list:
-      1) Take ONLY SAFE rows from do_not_apply.csv
-      2) Drop any filter that appears even once in avoid_pairs.csv (either column)
-      3) Ignore sequence order. Sort by: (risk ASC), (support DESC), (eliminations DESC if available)
-      4) Write CSV/TXT/HTML and return metadata
+    SAFE only → minus avoid_pairs → ignore sequence; sort by (risk ASC, support DESC, elim DESC if present).
     """
     safe_source_path  = Path(safe_source_path)
     avoid_pairs_path  = Path(avoid_pairs_path)
@@ -602,9 +579,29 @@ def build_final_safest_first_safelist(
     if not safe_source_path.exists() or not avoid_pairs_path.exists():
         return None
 
-    revised_safe_ids, metrics = _revised_safe_ids(safe_source_path, avoid_pairs_path)
-    if len(revised_safe_ids) == 0:
+    safe_df = pd.read_csv(safe_source_path)
+    tier_col = _detect_col(safe_df, ["tier", "Tier", "TIER"])
+    fid_col  = _detect_col(safe_df, ["filter_id", "Filter ID", "FILTER_ID", "fid", "FID", "id"])
+    if not tier_col or not fid_col:
         return None
+
+    safe_df[fid_col] = safe_df[fid_col].astype(str).str.strip()
+    safe_only = safe_df[safe_df[tier_col].astype(str).str.upper() == "SAFE"].copy()
+    safe_ids = set(safe_only[fid_col])
+
+    metrics = (
+        safe_only.rename(columns={fid_col: "filter_id"})
+        .drop_duplicates("filter_id")
+        .set_index("filter_id")
+    )
+
+    ap_df = pd.read_csv(avoid_pairs_path)
+    fid1 = _detect_col(ap_df, ["filter_id_1", "FID1", "fid1"])
+    fid2 = _detect_col(ap_df, ["filter_id_2", "FID2", "fid2"])
+    if not fid1 or not fid2:
+        return None
+    ap_ids = set(ap_df[fid1].astype(str).str.strip()) | set(ap_df[fid2].astype(str).str.strip())
+    revised_safe_ids = [fid for fid in safe_ids if fid not in ap_ids]
 
     elim_map: Dict[str, float] = {}
     if seq_path.exists():
@@ -655,120 +652,116 @@ def build_final_safest_first_safelist(
     final_df.to_html(out_html, index=False, escape=False)
 
     return {
-        "counts": {
-            "revised_safe": len(revised_safe_ids),
-            "final_total": len(ordered),
-        },
+        "counts": {"safe_only": len(safe_ids), "revised_safe": len(revised_safe_ids), "final_total": len(ordered)},
         "outputs": {"csv": str(out_csv), "txt": str(out_txt), "html": str(out_html)},
-        "order_mode": "safest_first",
     }
 
-def build_grouped_safelist_by_aggression(
+def build_final_grouped_by_aggression_on_pool(
+    filters_map: Dict[str, FilterDef],
+    base_env: Dict[str, object],
+    base_pool: List[str],
     safe_source_path: str | Path = "do_not_apply.csv",
     avoid_pairs_path: str | Path = "avoid_pairs.csv",
-    seq_path: str | Path = "recommender_sequence.csv",
     out_basename: str = "final_safe_grouped",
 ) -> Optional[Dict[str, object]]:
     """
-    Group revised SAFE filters by aggressiveness buckets (based on eliminations),
-    and sort each group safest->least safe (risk asc, support desc, then elim desc).
-    Buckets: 701+, 501–700, 301–500, 101–300, 61–100, 1–60, 0.
+    SAFE only → minus avoid_pairs → for each filter compute elim_count on the *baseline pool* (applied solo),
+    bucket by elim_count (701+, 501–700, 301–500, 101–300, 61–100, 1–60, 0), and within each bucket
+    sort by (risk ASC, support DESC, elim_count DESC). Write CSV/TXT/HTML.
     """
     safe_source_path  = Path(safe_source_path)
     avoid_pairs_path  = Path(avoid_pairs_path)
-    seq_path          = Path(seq_path)
     if not safe_source_path.exists() or not avoid_pairs_path.exists():
         return None
 
-    revised_safe_ids, metrics = _revised_safe_ids(safe_source_path, avoid_pairs_path)
-    if len(revised_safe_ids) == 0:
+    safe_df = pd.read_csv(safe_source_path)
+    tier_col = _detect_col(safe_df, ["tier", "Tier", "TIER"])
+    fid_col  = _detect_col(safe_df, ["filter_id", "Filter ID", "FILTER_ID", "fid", "FID", "id"])
+    if not tier_col or not fid_col:
         return None
 
-    elim_map: Dict[str, float] = {}
-    if seq_path.exists():
-        try:
-            seq_df = pd.read_csv(seq_path)
-            seq_fid = _detect_col(seq_df, ["filter_id", "Filter ID", "FILTER_ID", "fid", "FID", "id"])
-            elim_col = _detect_col(seq_df, ["eliminated_now", "eliminations", "elim_count", "elimination_count", "elims"])
-            if seq_fid and elim_col:
-                sids = seq_df[seq_fid].astype(str).str.strip()
-                elims = pd.to_numeric(seq_df[elim_col], errors="coerce").fillna(0.0)
-                elim_map = dict(zip(sids, elims))
-        except Exception:
-            elim_map = {}
+    safe_df[fid_col] = safe_df[fid_col].astype(str).str.strip()
+    safe_only = safe_df[safe_df[tier_col].astype(str).str.upper() == "SAFE"].copy()
+    safe_ids = set(safe_only[fid_col])
 
-    def elim_of(fid: str) -> float:
-        try: return float(elim_map.get(fid, 0.0))
-        except Exception: return 0.0
+    metrics = (
+        safe_only.rename(columns={fid_col: "filter_id"})
+        .drop_duplicates("filter_id")
+        .set_index("filter_id")
+    )
 
-    def risk_of(fid: str) -> float:
-        try: return float(metrics.loc[fid, "risk"])
-        except Exception: return 1e9
+    ap_df = pd.read_csv(avoid_pairs_path)
+    fid1 = _detect_col(ap_df, ["filter_id_1", "FID1", "fid1"])
+    fid2 = _detect_col(ap_df, ["filter_id_2", "FID2", "fid2"])
+    if not fid1 or not fid2:
+        return None
+    ap_ids = set(ap_df[fid1].astype(str).str.strip()) | set(ap_df[fid2].astype(str).str.strip())
+    revised_safe_ids = [fid for fid in safe_ids if fid not in ap_ids]
 
-    def support_of(fid: str) -> float:
-        try: return float(metrics.loc[fid, "support"])
-        except Exception: return -1e9
+    # Solo elimination on the baseline pool (today's pool), NO winner guard.
+    records = []
+    for fid in revised_safe_ids:
+        f = filters_map.get(fid)
+        if not f:
+            continue
+        _, elim = apply_filter_to_pool(f, base_env, base_pool)
+        rec = {"filter_id": fid, "elim_count": int(elim)}
+        if not metrics.empty and fid in metrics.index:
+            for col in ("risk","support","name"):
+                if col in metrics.columns:
+                    rec[col] = metrics.loc[fid, col]
+        records.append(rec)
 
-    def bucket(count: float) -> str:
-        c = float(count)
+    if not records:
+        return None
+
+    df = pd.DataFrame(records)
+    # Bucketization
+    def _bucket(c):
+        c = float(c)
         if c >= 701: return "701+"
         if c >= 501: return "501–700"
         if c >= 301: return "301–500"
         if c >= 101: return "101–300"
-        if c >= 61:  return "61–100"
-        if c >= 1:   return "1–60"
+        if c >=  61: return "61–100"
+        if c >=   1: return "1–60"
         return "0"
+    df["group"] = df["elim_count"].map(_bucket)
 
+    # Ordering
     order_buckets = ["701+","501–700","301–500","101–300","61–100","1–60","0"]
-    rows = []
-    for fid in revised_safe_ids:
-        rows.append({
-            "group": bucket(elim_of(fid)),
-            "filter_id": fid,
-            "risk": risk_of(fid),
-            "support": support_of(fid),
-            "elim_count": elim_of(fid),
-        })
-    df = pd.DataFrame(rows)
-    # sort within groups safest->least safe; groups most->least aggressive
-    df["group_rank"] = df["group"].map({b:i for i,b in enumerate(order_buckets)})
-    df = df.sort_values(["group_rank","risk","support","elim_count","filter_id"],
-                        ascending=[True, True, False, False, True])
-    # output files
+    bucket_rank = {b:i for i,b in enumerate(order_buckets)}
+    df["__bucket_rank"] = df["group"].map(bucket_rank).fillna(len(order_buckets)).astype(int)
+
+    def _risk(x): 
+        try: return float(x)
+        except Exception: return 1e9
+    def _support(x):
+        try: return float(x)
+        except Exception: return -1e9
+
+    df = df.sort_values(
+        by=["__bucket_rank","risk","support","elim_count","filter_id"],
+        ascending=[True, True, False, False, True]
+    ).drop(columns="__bucket_rank")
+
+    # Write files
     from datetime import datetime
     ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     base = f"{out_basename}_{ts}"
     out_csv = OUTPUT_DIR / f"{base}.csv"
     out_txt = OUTPUT_DIR / f"{base}.txt"
     out_html = OUTPUT_DIR / f"{base}.html"
-    df_out = df.drop(columns=["group_rank"]).copy()
-    df_out.to_csv(out_csv, index=False)
-    # txt grouped with headers
-    with open(out_txt, "w", encoding="utf-8") as f:
-        for grp in order_buckets:
-            block = df_out[df_out["group"] == grp]
-            if block.empty: 
-                continue
-            f.write(f"[{grp}]\n")
-            for _, r in block.iterrows():
-                f.write(f"{r['filter_id']}\n")
-            f.write("\n")
-    # simple HTML sections
-    html_parts = ["<html><head><meta charset='utf-8'><title>Grouped SafeList</title></head><body>"]
-    for grp in order_buckets:
-        block = df_out[df_out["group"] == grp]
-        if block.empty:
-            continue
-        html_parts.append(f"<h3>{grp}</h3>")
-        html_parts.append(block.to_html(index=False))
-    html_parts.append("</body></html>")
-    Path(out_html).write_text("\n".join(html_parts), encoding="utf-8")
 
-    return {
-        "counts": {"revised_safe": len(revised_safe_ids), "final_total": len(df_out)},
-        "outputs": {"csv": str(out_csv), "txt": str(out_txt), "html": str(out_html)},
-        "order_mode": "grouped_by_aggression",
-    }
+    df.to_csv(out_csv, index=False)
+    with open(out_txt, "w", encoding="utf-8") as f:
+        for _, r in df.iterrows():
+            f.write(f"{r['filter_id']}\n")
+    df.to_html(out_html, index=False, escape=False)
+
+    counts_by_group = df["group"].value_counts().to_dict()
+    return {"outputs": {"csv": str(out_csv), "txt": str(out_txt), "html": str(out_html)},
+            "counts_by_group": counts_by_group}
 
 # =============================================================================
 # Public entry
@@ -791,6 +784,7 @@ def main(
     affinity_exclude_top_pct: Optional[float] = None,
     include_nopool_panel: bool = INCLUDE_NOPOOL_PANEL,
 ):
+
     winners_path = winners_csv or WINNERS_CSV
     filters_path = filters_csv or FILTERS_CSV
 
@@ -809,7 +803,7 @@ def main(
 
     idx_now, applicable, env_now = today_applicable_filters(filters_list, winners)
 
-    # Restrict to a subset if provided
+    # If caller wants to limit to a subset of filters
     if applicable_only:
         applicable_only = {fid.strip() for fid in applicable_only}
         applicable = {fid: f for fid, f in applicable.items() if fid in applicable_only}
@@ -845,28 +839,48 @@ def main(
         pool = pool_df["combo"].astype(str).tolist()
 
     remaining = len(pool)
+    winner_today = winners[idx_now] if pool else None
+
     seq_rows = []  # step log
 
     # ===== Anti-affinity pre-trim (drop top X% most seed-like) =====
     if pool and affinity_exclude_top_pct and 0 < float(affinity_exclude_top_pct) < 1:
         aff = np.array([combo_affinity(env_now, c) for c in pool], dtype=float)
         ranks = pd.Series(aff).rank(method="average", ascending=True)
-        thr = 1.0 - float(affinity_exclude_top_pct)
+        thr = 1.0 - float(affinity_exclude_top_pct)          # drop top X%  ≡ aff_pct >= thr
         aff_pct = (ranks - 1) / max(len(pool) - 1, 1)
 
-        keep_mask = aff_pct < thr
-        new_pool = [c for c, keep in zip(pool, keep_mask) if keep]
-        elim = len(pool) - len(new_pool)
-        pool = new_pool
-        remaining = len(pool)
-        seq_rows.append({
-            "step": 0,
-            "filter_id": f"AFF_TOP{int(round(affinity_exclude_top_pct*100))}",
-            "name": f"Anti-affinity: drop top {int(round(affinity_exclude_top_pct*100))}%",
-            "eliminated_now": elim,
-            "remaining": remaining,
-            "skipped_reason": None,
-        })
+        # winner percentile (if in pool)
+        try:
+            win_ix = pool.index(winner_today)
+            win_pct = float(aff_pct.iloc[win_ix])
+        except Exception:
+            win_pct = float("nan")
+
+        would_remove = (not np.isnan(win_pct)) and (win_pct >= thr)
+        if always_keep_winner and would_remove:
+            seq_rows.append({
+                "step": 0,
+                "filter_id": f"AFF_TOP{int(round(affinity_exclude_top_pct*100))}",
+                "name": f"Anti-affinity: drop top {int(round(affinity_exclude_top_pct*100))}%",
+                "eliminated_now": 0,
+                "remaining": remaining,
+                "skipped_reason": "would_remove_winner",
+            })
+        else:
+            keep_mask = aff_pct < thr
+            new_pool = [c for c, keep in zip(pool, keep_mask) if keep]
+            elim = len(pool) - len(new_pool)
+            pool = new_pool
+            remaining = len(pool)
+            seq_rows.append({
+                "step": 0,
+                "filter_id": f"AFF_TOP{int(round(affinity_exclude_top_pct*100))}",
+                "name": f"Anti-affinity: drop top {int(round(affinity_exclude_top_pct*100))}%",
+                "eliminated_now": elim,
+                "remaining": remaining,
+                "skipped_reason": None,
+            })
 
     # ===== Pair conflicts (for "avoid pairs" table) =====
     avoid_rows = []
@@ -892,14 +906,27 @@ def main(
         ["pair_risk","co_applicable_n"], ascending=[False,False]
     ).to_csv(OUTPUT_DIR / "avoid_pairs.csv", index=False)
 
-    # ===== Apply filters in order =====
+    # ===== Apply filters in order (no winner guard in prediction mode) =====
     base_env = env_now
     final_pool = pool[:] if pool else None
 
     for step, f in enumerate(ranked, start=1):
         fid = f.fid
+        conflicts = []
+        for other in applicable:
+            if other == fid: continue
+            pr = pair_risk.get((fid,other)) or pair_risk.get((other,fid)) or 0.0
+            if pr > 0: conflicts.append(other)
+
         if final_pool is not None:
             new_pool, elim = apply_filter_to_pool(f, base_env, final_pool)
+            if ALWAYS_KEEP_WINNER and (winner_today in final_pool) and (winner_today not in new_pool):
+                seq_rows.append({
+                    "step": step, "filter_id": fid, "name": f.name,
+                    "eliminated_now": 0, "remaining": remaining,
+                    "skipped_reason": "would_remove_winner"
+                })
+                continue
             if elim == 0:
                 seq_rows.append({
                     "step": step, "filter_id": fid, "name": f.name,
@@ -934,7 +961,7 @@ def main(
     # ===== Tier list (quick “do not apply” summary) =====
     rows = []
     for fid, f in applicable.items():
-        risk = float(single_fail.get(fid, 0.0))
+        risk = float((single_fail.get(fid, 0.0)))
         sup  = int(support.get(fid, 0))
         if risk >= 0.20 and sup >= 6: tier = "DO_NOT_APPLY"
         elif risk >= 0.10:            tier = "APPLY_LATE"
@@ -962,20 +989,38 @@ def main(
         )
 
     # ===== Build the three SafeLists =====
-    final_meta_seq    = build_final_ordered_safelist()
-    final_meta_safest = build_final_safest_first_safelist()
-    final_meta_group  = build_grouped_safelist_by_aggression()
+    final_safe_meta_seq = build_final_ordered_safelist(
+        safe_source_path=OUTPUT_DIR / "do_not_apply.csv",
+        avoid_pairs_path=OUTPUT_DIR / "avoid_pairs.csv",
+        seq_path=OUTPUT_DIR / "recommender_sequence.csv",
+        out_basename="final_safe_ordered",
+    )
+    final_safe_meta_safest = build_final_safest_first_safelist(
+        safe_source_path=OUTPUT_DIR / "do_not_apply.csv",
+        avoid_pairs_path=OUTPUT_DIR / "avoid_pairs.csv",
+        seq_path=OUTPUT_DIR / "recommender_sequence.csv",
+        out_basename="final_safe_safest_first",
+    )
+    final_safe_meta_grouped = build_final_grouped_by_aggression_on_pool(
+        filters_map=filters_map,
+        base_env=base_env,
+        base_pool=(pool[:] if pool else []),
+        safe_source_path=OUTPUT_DIR / "do_not_apply.csv",
+        avoid_pairs_path=OUTPUT_DIR / "avoid_pairs.csv",
+        out_basename="final_safe_grouped",
+    )
 
     # ===== One-pager (HTML) =====
     seed_list = base_env['seed_digits_list']
     parity_major = "even>=3" if sum(1 for d in seed_list if d%2==0) >= 3 else "even<=2"
+    winner_kept = (winner_today in (final_pool or [])) if pool else True
 
     HTML_CSS = """<!doctype html><html lang='en'><head><meta charset='utf-8'>
 <title>DC5 Recommender — One-Pager</title>
 <style>
 :root { --fg:#0f172a; --muted:#64748b; --bg:#fff; }
 body { margin:0; font:14px/1.5 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Inter, Helvetica, Arial; color:var(--fg); background:var(--bg); }
-.wrap { max-width: 1000px; margin: 28px auto 64px; padding: 0 20px; }
+.wrap { max-width: 900px; margin: 28px auto 64px; padding: 0 20px; }
 h1 { font-size: 24px; margin: 0 0 8px; }
 h2 { font-size: 18px; margin: 24px 0 8px; }
 .card { border:1px solid #e2e8f0; border-radius:16px; padding:16px; box-shadow:0 1px 2px rgba(15,23,42,.04); }
@@ -984,8 +1029,9 @@ h2 { font-size: 18px; margin: 24px 0 8px; }
 .table th { background:#f8fafc; font-weight:700; }
 .kpi { background:#f8fafc; padding:8px 10px; border-radius:12px; border:1px solid #e2e8f0; display:inline-block; margin-right:8px; }
 .badge { display:inline-block; padding:6px 10px; border-radius:12px; background:#eef2ff; margin-right:8px; }
+.badge.ok { background:#ecfdf5; }
+.badge.bad { background:#fef2f2; }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
-.muted { color:#64748b; }
 </style></head><body><div class='wrap'>"""
 
     applied = seq_df[seq_df["eliminated_now"].notna() & (seq_df["eliminated_now"]>0)]
@@ -999,22 +1045,23 @@ h2 { font-size: 18px; margin: 24px 0 8px; }
         "<div style='margin-top:8px'><span class='kpi'>Anti-affinity default: drop top {}%</span></div>"
         "<div style='margin-top:8px'>"
         "<span class='badge'>Applicable filters: {}</span>"
+        "<span class='badge {}'>{}</span>"
         "<span class='badge'>Target: &lt; {}</span>"
-        "<span class='badge'>Final pool size: {}</span>"
+        "<span class='badge'>Final size: {}</span>"
         "</div></div>"
     ).format(
         html.escape(str(base_env['seed'])),
         base_env['seed_sum'], html.escape(base_env['seed_sum_category']),
         html.escape(classify_structure(seed_list)),
         base_env['spread_seed'], parity_major,
-        int(round((AFFINITY_EXCLUDE_TOP_PCT if affinity_exclude_top_pct is None else affinity_exCLUDE_TOP_PCT)*100))
-        if 'affinity_exCLUDE_TOP_PCT' in globals() else int(round((affinity_exclude_top_pct or AFFINITY_EXCLUDE_TOP_PCT)*100)),
+        int(round((AFFINITY_EXCLUDE_TOP_PCT)*100)),
         len(applicable),
+        "ok" if winner_kept else "bad", "Winner: " + ("KEPT" if winner_kept else "REMOVED"),
         TARGET_MAX+1,
         remaining if remaining is not None else "—"
     )
 
-    def df_to_html_table(df: pd.DataFrame, columns: list | None, empty_msg: str, limit: int = None):
+    def df_to_html_table(df: pd.DataFrame, columns: list, empty_msg: str, limit: int = None):
         if df is None or df.empty:
             return "<p class='muted mono'>{}</p>".format(html.escape(empty_msg))
         use = df[columns].copy() if columns else df.copy()
@@ -1026,48 +1073,17 @@ h2 { font-size: 18px; margin: 24px 0 8px; }
     avoid_sorted = avoid_df.sort_values(["pair_risk","co_applicable_n"], ascending=[False,False]) if not avoid_df.empty else avoid_df
 
     applied_html = df_to_html_table(applied, ["step","filter_id","name","eliminated_now","remaining"],
-                                    "No safe reduction steps.", 60)
+                                    "No reduction steps.", 60)
     skipped_html = df_to_html_table(skipped, ["filter_id","name","skipped_reason"],
                                     "No steps were skipped.", 60)
     avoid_html   = df_to_html_table(avoid_sorted,
                                     ["filter_id_1","filter_id_2","pair_risk","both_blocked_n","co_applicable_n"],
                                     "No high-risk pairs in this bucket.", 20)
 
-    def maybe_table_from(path_str: str, title: str) -> str:
-        p = Path(path_str)
-        if not p.exists(): return f"<p class='muted mono'>{title}: not built.</p>"
-        try:
-            df = pd.read_csv(p)
-            return df_to_html_table(df, None, f"{title}: empty.")
-        except Exception:
-            return f"<p class='muted mono'>{title}: written but could not preview.</p>"
-
-    seq_title = "Final Ordered SafeList — sequence-biased"
-    safe_title = "Final Ordered SafeList — safest-first (ignores sequence)"
-    grp_title = "Final Ordered SafeList — grouped by aggressiveness (safest inside groups)"
-
-    seq_html = maybe_table_from(sorted(OUTPUT_DIR.glob("final_safe_ordered_*.csv"))[-1].as_posix()
-                                if list(OUTPUT_DIR.glob("final_safe_ordered_*.csv")) else "",
-                                seq_title)
-    safest_html = maybe_table_from(sorted(OUTPUT_DIR.glob("final_safe_safest_first_*.csv"))[-1].as_posix()
-                                   if list(OUTPUT_DIR.glob("final_safe_safest_first_*.csv")) else "",
-                                   safe_title)
-    grouped_html = maybe_table_from(sorted(OUTPUT_DIR.glob("final_safe_grouped_*.csv"))[-1].as_posix()
-                                    if list(OUTPUT_DIR.glob("final_safe_grouped_*.csv")) else "",
-                                    grp_title)
-
     html_doc = HTML_CSS + snap + \
-        "<div class='card'><h2>Apply in this order (pool reduction log)</h2>{}</div>".format(applied_html) + \
+        "<div class='card'><h2>Apply in this order (sequence)</h2>{}</div>".format(applied_html) + \
         "<div class='card'><h2>Skipped steps</h2>{}</div>".format(skipped_html) + \
         "<div class='card'><h2>Avoid combining (today’s bucket)</h2>{}</div>".format(avoid_html) + \
-        (("<div class='card'><h2>Today — historically safe filter pairs (NoPool)</h2>{}</div>".format(
-            df_to_html_table(nopool_df, ["Filter A ID","Filter B ID","Days both applicable (history)",
-                                         "Winner kept % (both applicable)","Either blocks winner %","Both block winner %",
-                                         "Parity note (only if meaningful)"],
-                             "No historical pairs meet thresholds.", NOPOOL_MAX_ROWS))) if include_nopool_panel else "") + \
-        f"<div class='card'><h2>{seq_title}</h2>{seq_html}</div>" + \
-        f"<div class='card'><h2>{safe_title}</h2>{safest_html}</div>" + \
-        f"<div class='card'><h2>{grp_title}</h2>{grouped_html}</div>" + \
         "</div></body></html>"
 
     (OUTPUT_DIR / "one_pager.html").write_text(html_doc, encoding="utf-8")
@@ -1078,7 +1094,8 @@ __all__ = [
     "TARGET_MAX","ALWAYS_KEEP_WINNER","MINIMIZE_BEYOND_TARGET",
     "AFFINITY_EXCLUDE_TOP_PCT",
     "main","combo_affinity","get_pool_for_seed","nopool_today_pairs",
-    "build_final_ordered_safelist","build_final_safest_first_safelist","build_grouped_safelist_by_aggression"
+    "build_final_ordered_safelist","build_final_safest_first_safelist",
+    "build_final_grouped_by_aggression_on_pool"
 ]
 
 if __name__ == "__main__":
