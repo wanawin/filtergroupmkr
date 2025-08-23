@@ -279,3 +279,57 @@ with tabs[2]:
         _download_buttons(latest_csv, latest_txt, latest_html, "grouped")
     else:
         st.info("No grouped list found yet.")
+        # ---------- Archetype reports (NEW) ----------
+st.markdown("---")
+st.header("Archetype reports")
+
+def _load_csv(path: str):
+    p = Path(path)
+    if not p.exists():
+        return None, None
+    try:
+        df = pd.read_csv(p)
+    except Exception:
+        df = None
+    return p, df
+
+ar_files = [
+    ("archetypes_history_summary.csv", "History summary"),
+    ("archetypes_today_pool_mix.csv", "Today's pool mix"),
+    ("archetypes_feature_stats.csv", "Single-feature stats"),
+    ("archetypes_history_rows.csv", "History rows (full)"),
+]
+
+for fname, title in ar_files:
+    p, df = _load_csv(fname)
+    with st.expander(f"{title} — {fname}" + (f"  ·  updated {_fmt_dt(p)}" if p else ""), expanded=False):
+        if p is None:
+            st.info("Not found yet.")
+            continue
+        # Rows toggle
+        if df is not None:
+            show_all = st.radio(
+                f"Rows to show for {fname}",
+                options=["100", "300", "All"], horizontal=True, index=0
+            )
+            n = None
+            if show_all == "100": n = 100
+            elif show_all == "300": n = 300
+            if n is not None:
+                st.dataframe(df.head(n), use_container_width=True, hide_index=True)
+            else:
+                st.dataframe(df, use_container_width=True, hide_index=True)
+        else:
+            st.code(p.read_text(encoding="utf-8")[:5000])
+
+        # Download
+        fmt = st.radio(f"Download format for {fname}", ["CSV", "TXT"], horizontal=True, index=0)
+        with open(p, "rb") as fh:
+            st.download_button(
+                f"Download {fname}",
+                data=fh,
+                file_name=fname,
+                mime="text/csv" if fmt == "CSV" else "text/plain",
+                type="secondary",
+            )
+
