@@ -30,22 +30,15 @@ POOL_ARCHIVE_DIR = Path("pools")
 
 # --- NoPool integration knobs (historical signals; no simulated pool) ---
 INCLUDE_NOPOOL_PANEL = True
-NOPOOL_MIN_DAYS      = 60       # require both-applicable on ≥ this many days
-NOPOOL_MIN_KEEP      = 75.0     # show pairs with winner-kept ≥ this %
-NOPOOL_PARITY_SKEW   = 10.0     # show parity only if abs(50 - even%) ≥ this
-NOPOOL_MAX_ROWS      = 20       # how many pairs to list in the panel
+NOPOOL_MIN_DAYS      = 60
+NOPOOL_MIN_KEEP      = 75.0
+NOPOOL_PARITY_SKEW   = 10.0
+NOPOOL_MAX_ROWS      = 20
 
 # =============================================================================
 # Pool archive helpers
 # =============================================================================
 def get_pool_for_seed(seed_row: pd.Series, *, keep_permutations: bool = True) -> pd.DataFrame:
-    """
-    Load the EXACT pool your app had at the pre-CSV stage for this seed's date.
-    Strategy:
-      1) If seed_row has a Date/DrawDate, try pools/pool_YYYY-MM-DD.csv
-      2) Else/fallback to TODAY_POOL_CSV or repo-root today_pool.csv
-    Returns a DataFrame with a 'combo' column of 5-digit strings.
-    """
     date_val = None
     for c in getattr(seed_row, "index", []):
         lc = str(c).lower()
@@ -77,9 +70,7 @@ def get_pool_for_seed(seed_row: pd.Series, *, keep_permutations: bool = True) ->
         else:
             raise RuntimeError("Pool CSV must contain 'combo' or 'Result' column.")
 
-    df["combo"] = (
-        df["combo"].astype(str).str.replace(r"\D", "", regex=True).str.zfill(5)
-    )
+    df["combo"] = df["combo"].astype(str).str.replace(r"\D", "", regex=True).str.zfill(5)
     df = df[df["combo"].str.fullmatch(r"\d{5}")]
     return df[["combo"]].copy()
 
@@ -238,32 +229,23 @@ def classify_structure(digs: List[int]) -> str:
     return "single"
 
 def combo_affinity(env_now: Dict[str, object], combo: str) -> float:
-    """
-    Deterministic similarity score used only for ranking within today's pool.
-    Higher = 'more similar' to seed. We will DROP the top X% (anti-affinity).
-    """
     cd = digits_of(combo)
     seedd = env_now["seed_digits_list"]
     combo_sum, seed_sum = sum(cd), env_now["seed_sum"]
     sum_prox = math.exp(-abs(combo_sum - seed_sum) / 2.0)
-
     spread_c = max(cd) - min(cd)
     spread_s = env_now["spread_seed"]
     spread_prox = math.exp(-abs(spread_c - spread_s) / 2.0)
-
     struct_match = 1.0 if classify_structure(cd) == classify_structure(seedd) else 0.0
     parity_match = 1.0 if _parity_major_label(cd) == _parity_major_label(seedd) else 0.0
-
     hi8_seed = sum(1 for d in seedd if d >= 8)
     hi8_combo = sum(1 for d in cd if d >= 8)
     if hi8_seed >= 3:
         hi8_score = math.exp(-max(0, hi8_combo - 1))
     else:
         hi8_score = math.exp(-abs(hi8_combo - hi8_seed) / 1.5)
-
     overlap = len(set(seedd) & set(cd))
     overlap_eq1 = 1.0 if overlap == 1 else 0.0
-
     W_SUM, W_SPD, W_STR, W_PAR, W_HI8, W_OV1 = 0.8, 0.3, 0.4, 0.15, 0.35, 0.25
     return (
         W_SUM * sum_prox + W_SPD * spread_prox + W_STR * struct_match +
@@ -290,7 +272,6 @@ def historical_risk_for_applicable(
     decay_half_life: Optional[int] = None,
 ):
     env_now = build_env_for_draw(idx_now, winners)
-
     start_idx = max(1, (idx_now - (max_draws or (idx_now - 1))))
     candidate_indices = list(range(start_idx, idx_now))
 
@@ -375,22 +356,15 @@ def nopool_today_pairs(
     parity_skew: float = NOPOOL_PARITY_SKEW,
     max_rows: int = NOPOOL_MAX_ROWS,
 ) -> pd.DataFrame:
-    """
-    Compute historical stats for PAIRS drawn ONLY from today's applicable filters.
-    Fast, no simulated pools. Returns a dataframe with plain-English columns.
-    """
-    # Build envs for history days 1..idx_now-1 (each i uses seed=w[i-1], winner=w[i])
     N = idx_now
     if N < 2:
         return pd.DataFrame()
     envs = [build_env_for_draw(i, winners) for i in range(1, idx_now+1)]
-    # Today's applicable filter IDs
     env_now = envs[-1]
     todays_ids = [fid for fid, f in filters_all.items() if safe_eval(f.applicable_if, env_now)]
     if len(todays_ids) < 2:
         return pd.DataFrame()
 
-    # Compile expressions for just today's filters
     f_slice = {fid: filters_all[fid] for fid in todays_ids}
     comp_app = {}
     comp_blk = {}
@@ -400,7 +374,6 @@ def nopool_today_pairs(
         try:  comp_blk[fid] = compile(f.expression if f.expression else "False", "<expr>", "eval")
         except Exception: comp_blk[fid] = compile("False", "<expr>", "eval")
 
-    # Evaluate applicability/blocking per day for these filters
     F = len(f_slice)
     idx_map = {fid:i for i,fid in enumerate(todays_ids)}
     app = np.zeros((N, F), dtype=bool)
@@ -408,7 +381,6 @@ def nopool_today_pairs(
     even_arr = np.zeros(N, dtype=int)
 
     for i, env in enumerate(envs):
-        # winner parity
         even_arr[i] = 1 if (sum(env["combo_digits_list"]) % 2 == 0) else 0
         for fid in todays_ids:
             j = idx_map[fid]
@@ -424,7 +396,6 @@ def nopool_today_pairs(
                     b = False
                 blk[i, j] = b
 
-    # Compute pair stats for these filters
     recs = []
     for a_idx in range(F):
         for b_idx in range(a_idx+1, F):
@@ -436,7 +407,6 @@ def nopool_today_pairs(
             both_blocks  = int(((blk[:, a_idx] & blk[:, b_idx]) & mask).sum())
             kept_rate = (1 - (either_blocks / n)) * 100.0
             even_rate = float(even_arr[mask].mean() * 100.0)
-            # Only show parity if sufficiently skewed from 50/50
             parity_note = ""
             if abs(even_rate - 50.0) >= float(parity_skew):
                 tip = "EVEN" if even_rate >= 50.0 else "ODD"
@@ -459,16 +429,14 @@ def nopool_today_pairs(
         ["Winner kept % (both applicable)", "Days both applicable (history)"],
         ascending=[False, False]
     )
-    # Keep only “viable” by thresholds; still write all to CSV for transparency
     df_viable = df[(df["Days both applicable (history)"] >= int(min_days)) &
                    (df["Winner kept % (both applicable)"] >= float(min_keep))].copy()
-    # Persist
     df.to_csv(OUTPUT_DIR / "NoPool_today_pairs_ALL.csv", index=False)
     df_viable.head(max_rows).to_csv(OUTPUT_DIR / "NoPool_today_pairs_TOP.csv", index=False)
     return df_viable.head(max_rows)
 
 # =============================================================================
-# Final Ordered SafeList builder (SAFE from do_not_apply.csv  –  minus avoid_pairs.csv  –> sequenced)
+# Column detector
 # =============================================================================
 def _detect_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     for c in candidates:
@@ -476,22 +444,15 @@ def _detect_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
             return c
     return None
 
+# =============================================================================
+# Final Ordered SafeList (respect sequence)
+# =============================================================================
 def build_final_ordered_safelist(
     safe_source_path: str | Path = "do_not_apply.csv",
     avoid_pairs_path: str | Path = "avoid_pairs.csv",
     seq_path: str | Path = "recommender_sequence.csv",
     out_basename: str = "final_safe_ordered",
 ) -> Optional[Dict[str, object]]:
-    """
-    Spec:
-      1) Take ONLY the SAFE rows from do_not_apply.csv
-      2) Remove any filter that appears even once in avoid_pairs.csv (either column)
-      3) Reorder this REVISED safelist using recommender_sequence.csv order
-         (do NOT drop anything from the revised safelist).
-         Items not present in the sequence go to the bottom, sorted by aggressiveness:
-           priority: eliminations (from sequence) -> support -> risk (from do_not_apply.csv)
-      4) Emit CSV, TXT, HTML and return metadata
-    """
     safe_source_path  = Path(safe_source_path)
     avoid_pairs_path  = Path(avoid_pairs_path)
     seq_path          = Path(seq_path)
@@ -499,7 +460,6 @@ def build_final_ordered_safelist(
     if not safe_source_path.exists() or not avoid_pairs_path.exists():
         return None
 
-    # --- 1) SAFE only from do_not_apply.csv
     safe_df = pd.read_csv(safe_source_path)
     tier_col = _detect_col(safe_df, ["tier", "Tier", "TIER"])
     fid_col  = _detect_col(safe_df, ["filter_id", "Filter ID", "FILTER_ID", "fid", "FID", "id"])
@@ -510,24 +470,18 @@ def build_final_ordered_safelist(
     safe_only = safe_df[safe_df[tier_col].astype(str).str.upper() == "SAFE"].copy()
     safe_ids = set(safe_only[fid_col])
 
-    # metrics for later (support / risk)
-    metrics = (
-        safe_only.rename(columns={fid_col: "filter_id"})
-        .drop_duplicates("filter_id")
-        .set_index("filter_id")
-    )
+    metrics = (safe_only.rename(columns={fid_col: "filter_id"})
+               .drop_duplicates("filter_id")
+               .set_index("filter_id"))
 
-    # --- 2) Remove anything that appears in avoid_pairs.csv
     ap_df = pd.read_csv(avoid_pairs_path)
     fid1 = _detect_col(ap_df, ["filter_id_1", "FID1", "fid1"])
     fid2 = _detect_col(ap_df, ["filter_id_2", "FID2", "fid2"])
     if not fid1 or not fid2:
         return None
     ap_ids = set(ap_df[fid1].astype(str).str.strip()) | set(ap_df[fid2].astype(str).str.strip())
-
     revised_safe_ids = [fid for fid in safe_ids if fid not in ap_ids]
 
-    # --- 3) Reorder by recommender_sequence.csv, append leftovers by aggressiveness
     in_seq_order, not_in_seq = [], []
     elim_map: Dict[str, float] = {}
 
@@ -537,15 +491,12 @@ def build_final_ordered_safelist(
         if seq_fid:
             seq_df[seq_fid] = seq_df[seq_fid].astype(str).str.strip()
             seq_order = seq_df[seq_fid].tolist()
-            # eliminations column is optional
             elim_col = _detect_col(seq_df, ["eliminated_now", "eliminations", "elim_count", "elimination_count", "elims"])
             if elim_col:
                 try:
                     elim_map = dict(zip(seq_df[seq_fid], pd.to_numeric(seq_df[elim_col], errors="coerce").fillna(0)))
                 except Exception:
                     elim_map = {}
-
-            # keep all revised IDs that appear in the sequence, in that exact order
             in_seq_order = [fid for fid in seq_order if fid in revised_safe_ids]
             remaining = [fid for fid in revised_safe_ids if fid not in set(in_seq_order)]
         else:
@@ -554,15 +505,12 @@ def build_final_ordered_safelist(
         remaining = list(revised_safe_ids)
 
     def aggression(fid: str) -> float:
-        # 1) eliminations from the sequence, if available
         if fid in elim_map:
             try: return float(elim_map[fid])
             except Exception: pass
-        # 2) support from do_not_apply.csv
         if "support" in metrics.columns and fid in metrics.index:
             try: return float(metrics.loc[fid, "support"])
             except Exception: pass
-        # 3) risk from do_not_apply.csv
         if "risk" in metrics.columns and fid in metrics.index:
             try: return float(metrics.loc[fid, "risk"])
             except Exception: pass
@@ -571,7 +519,6 @@ def build_final_ordered_safelist(
     not_in_seq = sorted(remaining, key=aggression, reverse=True)
     final_ids = in_seq_order + not_in_seq
 
-    # --- 4) Outputs
     from datetime import datetime
     ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     base = f"{out_basename}_{ts}"
@@ -597,12 +544,96 @@ def build_final_ordered_safelist(
             "not_in_sequence": len(not_in_seq),
             "final_total": len(final_ids),
         },
-        "outputs": {
-            "csv": str(out_csv),
-            "txt": str(out_txt),
-            "html": str(out_html),
-            "sequence_used": seq_path.exists(),
-        }
+        "outputs": {"csv": str(out_csv), "txt": str(out_txt), "html": str(out_html), "sequence_used": seq_path.exists()},
+    }
+
+# =============================================================================
+# Safest-first SafeList (ignore sequence)
+# =============================================================================
+def build_final_safest_first_safelist(
+    safe_source_path: str | Path = "do_not_apply.csv",
+    avoid_pairs_path: str | Path = "avoid_pairs.csv",
+    seq_path: str | Path = "recommender_sequence.csv",
+    out_basename: str = "final_safe_safest_first",
+) -> Optional[Dict[str, object]]:
+    safe_source_path  = Path(safe_source_path)
+    avoid_pairs_path  = Path(avoid_pairs_path)
+    seq_path          = Path(seq_path)
+
+    if not safe_source_path.exists() or not avoid_pairs_path.exists():
+        return None
+
+    safe_df = pd.read_csv(safe_source_path)
+    tier_col = _detect_col(safe_df, ["tier", "Tier", "TIER"])
+    fid_col  = _detect_col(safe_df, ["filter_id", "Filter ID", "FILTER_ID", "fid", "FID", "id"])
+    if not tier_col or not fid_col:
+        return None
+
+    safe_df[fid_col] = safe_df[fid_col].astype(str).str.strip()
+    safe_only = safe_df[safe_df[tier_col].astype(str).str.upper() == "SAFE"].copy()
+    safe_ids = set(safe_only[fid_col])
+
+    metrics = (safe_only.rename(columns={fid_col: "filter_id"})
+               .drop_duplicates("filter_id")
+               .set_index("filter_id"))
+
+    ap_df = pd.read_csv(avoid_pairs_path)
+    fid1 = _detect_col(ap_df, ["filter_id_1", "FID1", "fid1"])
+    fid2 = _detect_col(ap_df, ["filter_id_2", "FID2", "fid2"])
+    if not fid1 or not fid2:
+        return None
+    ap_ids = set(ap_df[fid1].astype(str).str.strip()) | set(ap_df[fid2].astype(str).str.strip())
+    revised_safe_ids = [fid for fid in safe_ids if fid not in ap_ids]
+
+    elim_map: Dict[str, float] = {}
+    if seq_path.exists():
+        try:
+            seq_df = pd.read_csv(seq_path)
+            seq_fid = _detect_col(seq_df, ["filter_id", "Filter ID", "FILTER_ID", "fid", "FID", "id"])
+            elim_col = _detect_col(seq_df, ["eliminated_now", "eliminations", "elim_count", "elimination_count", "elims"])
+            if seq_fid and elim_col:
+                elim_map = dict(zip(
+                    seq_df[seq_fid].astype(str).str.strip(),
+                    pd.to_numeric(seq_df[elim_col], errors="coerce").fillna(0.0)
+                ))
+        except Exception:
+            elim_map = {}
+
+    def risk_of(fid: str) -> float:
+        try: return float(metrics.loc[fid, "risk"])
+        except Exception: return 1e9
+
+    def support_of(fid: str) -> float:
+        try: return float(metrics.loc[fid, "support"])
+        except Exception: return -1e9
+
+    def elims_of(fid: str) -> float:
+        try: return float(elim_map.get(fid, 0.0))
+        except Exception: return 0.0
+
+    ordered = sorted(revised_safe_ids, key=lambda fid: (risk_of(fid), -support_of(fid), -elims_of(fid)))
+
+    from datetime import datetime
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    base = f"{out_basename}_{ts}"
+    out_csv = OUTPUT_DIR / f"{base}.csv"
+    out_txt = OUTPUT_DIR / f"{base}.txt"
+    out_html = OUTPUT_DIR / f"{base}.html"
+
+    final_df = pd.DataFrame({"filter_id": ordered})
+    if not metrics.empty:
+        final_df = final_df.merge(metrics.reset_index(), on="filter_id", how="left")
+
+    final_df.to_csv(out_csv, index=False)
+    with open(out_txt, "w", encoding="utf-8") as f:
+        for fid in ordered:
+            f.write(f"{fid}\n")
+    final_df.to_html(out_html, index=False, escape=False)
+
+    return {
+        "counts": {"safe_only": len(safe_ids), "revised_safe": len(revised_safe_ids), "final_total": len(ordered)},
+        "outputs": {"csv": str(out_csv), "txt": str(out_txt), "html": str(out_html)},
+        "order_mode": "safest_first",
     }
 
 # =============================================================================
@@ -626,7 +657,6 @@ def main(
     affinity_exclude_top_pct: Optional[float] = None,
     include_nopool_panel: bool = INCLUDE_NOPOOL_PANEL,
 ):
-
     winners_path = winners_csv or WINNERS_CSV
     filters_path = filters_csv or FILTERS_CSV
 
@@ -671,9 +701,7 @@ def main(
         if "combo" not in df_pool.columns:
             if "Result" in df_pool.columns: df_pool = df_pool.rename(columns={"Result":"combo"})
             else: raise ValueError("Pool CSV must have 'combo' or 'Result' column.")
-        pool = (
-            df_pool["combo"].astype(str).str.replace(r"\D","",regex=True).str.zfill(5)
-        )
+        pool = df_pool["combo"].astype(str).str.replace(r"\D","",regex=True).str.zfill(5)
         pool = pool[pool.str.fullmatch(r"\d{5}")].tolist()
     else:
         seed_row = winners_df.iloc[idx_now-1]
@@ -683,22 +711,19 @@ def main(
     remaining = len(pool)
     winner_today = winners[idx_now] if pool else None
 
-    seq_rows = []  # step log
+    seq_rows = []
 
-    # ===== Anti-affinity pre-trim (drop top X% most seed-like) =====
+    # ===== Anti-affinity pre-trim =====
     if pool and affinity_exclude_top_pct and 0 < float(affinity_exclude_top_pct) < 1:
         aff = np.array([combo_affinity(env_now, c) for c in pool], dtype=float)
         ranks = pd.Series(aff).rank(method="average", ascending=True)
-        thr = 1.0 - float(affinity_exclude_top_pct)          # drop top X%  ≡ aff_pct >= thr
+        thr = 1.0 - float(affinity_exclude_top_pct)
         aff_pct = (ranks - 1) / max(len(pool) - 1, 1)
-
-        # winner percentile (if in pool)
         try:
             win_ix = pool.index(winner_today)
             win_pct = float(aff_pct.iloc[win_ix])
         except Exception:
             win_pct = float("nan")
-
         would_remove = (not np.isnan(win_pct)) and (win_pct >= thr)
         if always_keep_winner and would_remove:
             seq_rows.append({
@@ -754,14 +779,6 @@ def main(
 
     for step, f in enumerate(ranked, start=1):
         fid = f.fid
-        est_risk = round(float(single_fail.get(fid, 1.0)), 6)
-        conflicts = []
-        for other in applicable:
-            if other == fid: continue
-            pr = pair_risk.get((fid,other)) or pair_risk.get((other,fid)) or 0.0
-            if pr > 0: conflicts.append(other)
-        conflicts_str = ",".join(sorted(conflicts))
-
         if final_pool is not None:
             new_pool, elim = apply_filter_to_pool(f, base_env, final_pool)
             if ALWAYS_KEEP_WINNER and (winner_today in final_pool) and (winner_today not in new_pool):
@@ -788,7 +805,6 @@ def main(
             if (remaining <= target_max) and (not minimize_beyond_target):
                 break
         else:
-            # No pool supplied — still report order & reasons
             seq_rows.append({
                 "step": step, "filter_id": fid, "name": f.name,
                 "eliminated_now": None, "remaining": None,
@@ -822,7 +838,7 @@ def main(
         )
         do_not_df.to_csv(OUTPUT_DIR / "do_not_apply.csv", index=False)
 
-    # ===== NoPool panel (today’s historically safe pairs) =====
+    # ===== NoPool panel =====
     nopool_df = pd.DataFrame()
     if include_nopool_panel:
         nopool_df = nopool_today_pairs(
@@ -833,12 +849,19 @@ def main(
             max_rows=NOPOOL_MAX_ROWS,
         )
 
-    # ===== Final Ordered SafeList build (SAFE from do_not_apply.csv minus avoid_pairs.csv → Sequenced) =====
+    # ===== Final SafeList builds =====
     final_safe_meta = build_final_ordered_safelist(
         safe_source_path=OUTPUT_DIR / "do_not_apply.csv",
         avoid_pairs_path=OUTPUT_DIR / "avoid_pairs.csv",
         seq_path=OUTPUT_DIR / "recommender_sequence.csv",
         out_basename="final_safe_ordered",
+    )
+
+    final_safe_safest_meta = build_final_safest_first_safelist(
+        safe_source_path=OUTPUT_DIR / "do_not_apply.csv",
+        avoid_pairs_path=OUTPUT_DIR / "avoid_pairs.csv",
+        seq_path=OUTPUT_DIR / "recommender_sequence.csv",
+        out_basename="final_safe_safest_first",
     )
 
     # ===== One-pager (HTML) =====
@@ -868,6 +891,39 @@ h2 { font-size: 18px; margin: 24px 0 8px; }
     applied = seq_df[seq_df["eliminated_now"].notna() & (seq_df["eliminated_now"]>0)]
     skipped = seq_df[seq_df["skipped_reason"].notna() & (seq_df["skipped_reason"]!="")]
 
+    def df_to_html_table(df: pd.DataFrame, columns: list, empty_msg: str, limit: int = None):
+        if df is None or df.empty:
+            return "<p class='muted mono'>{}</p>".format(html.escape(empty_msg))
+        use = df[columns].copy() if columns else df.copy()
+        if limit: use = use.head(limit)
+        return use.to_html(index=False, classes="table", border=0, escape=True)
+
+    avoid_path = OUTPUT_DIR / "avoid_pairs.csv"
+    avoid_df = pd.read_csv(avoid_path) if avoid_path.exists() else pd.DataFrame()
+    avoid_sorted = avoid_df.sort_values(["pair_risk","co_applicable_n"], ascending=[False,False]) if not avoid_df.empty else avoid_df
+
+    applied_html = df_to_html_table(applied, ["step","filter_id","name","eliminated_now","remaining"], "No safe reduction steps.", 60)
+    skipped_html = df_to_html_table(skipped, ["filter_id","name","skipped_reason"], "No steps were skipped.", 60)
+    avoid_html   = df_to_html_table(avoid_sorted, ["filter_id_1","filter_id_2","pair_risk","both_blocked_n","co_applicable_n"], "No high-risk pairs in this bucket.", 20)
+
+    # Final Ordered (sequence-respecting)
+    final_html = "<p class='muted mono'>Final Ordered SafeList not built (missing inputs).</p>"
+    if final_safe_meta and final_safe_meta.get("outputs", {}).get("csv"):
+        try:
+            fs_df = pd.read_csv(final_safe_meta["outputs"]["csv"])
+            final_html = df_to_html_table(fs_df, [], "Final Ordered SafeList is empty.", None if len(fs_df)<=400 else 400)
+        except Exception:
+            pass
+
+    # Safest-first
+    safest_html = "<p class='muted mono'>Safest-first SafeList not built (missing inputs).</p>"
+    if final_safe_safest_meta and final_safe_safest_meta.get("outputs", {}).get("csv"):
+        try:
+            sf_df = pd.read_csv(final_safe_safest_meta["outputs"]["csv"])
+            safest_html = df_to_html_table(sf_df, [], "Safest-first list is empty.", None if len(sf_df)<=400 else 400)
+        except Exception:
+            pass
+
     snap = (
         "<h1>DC5 Recommender — One-Pager</h1>"
         "<div class='card'><div><b>Seed:</b> {} &nbsp;·&nbsp; <b>Sum:</b> {} ({}) "
@@ -885,171 +941,30 @@ h2 { font-size: 18px; margin: 24px 0 8px; }
         base_env['seed_sum'], html.escape(base_env['seed_sum_category']),
         html.escape(classify_structure(seed_list)),
         base_env['spread_seed'], parity_major,
-        int(round((AFFINITY_EXCLUDE_TOP_PCT if affinity_exclude_top_pct is None else affinity_exclude_top_pct)*100)),
+        int(round((AFFINITY_EXCLUDE_TOP_PCT)*100)),
         len(applicable),
         "ok" if winner_kept else "bad", "Winner: " + ("KEPT" if winner_kept else "REMOVED"),
         TARGET_MAX+1,
         remaining if remaining is not None else "—"
     )
 
-    def df_to_html_table(df: pd.DataFrame, columns: list, empty_msg: str, limit: int = None):
-        if df is None or df.empty:
-            return "<p class='muted mono'>{}</p>".format(html.escape(empty_msg))
-        use = df[columns].copy() if columns else df.copy()
-        if limit: use = use.head(limit)
-        return use.to_html(index=False, classes="table", border=0, escape=True)
-
-    avoid_path = OUTPUT_DIR / "avoid_pairs.csv"
-    avoid_df = pd.read_csv(avoid_path) if avoid_path.exists() else pd.DataFrame()
-    avoid_sorted = avoid_df.sort_values(["pair_risk","co_applicable_n"], ascending=[False,False]) if not avoid_df.empty else avoid_df
-
-    applied_html = df_to_html_table(applied, ["step","filter_id","name","eliminated_now","remaining"],
-                                    "No safe reduction steps.", 60)
-    skipped_html = df_to_html_table(skipped, ["filter_id","name","skipped_reason"],
-                                    "No steps were skipped.", 60)
-    avoid_html   = df_to_html_table(avoid_sorted,
-                                    ["filter_id_1","filter_id_2","pair_risk","both_blocked_n","co_applicable_n"],
-                                    "No high-risk pairs in this bucket.", 20)
-
-    # NoPool panel
-    nopool_html = ""
-    if include_nopool_panel:
-        nopool_cols = ["Filter A ID","Filter B ID","Days both applicable (history)",
-                       "Winner kept % (both applicable)","Either blocks winner %","Both block winner %",
-                       "Parity note (only if meaningful)"]
-        nopool_html = df_to_html_table(nopool_df, nopool_cols,
-                                       f"No historical pairs meet thresholds (min_days={NOPOOL_MIN_DAYS}, min_keep={NOPOOL_MIN_KEEP}%).",
-                                       NOPOOL_MAX_ROWS)
-
-    # Final Ordered SafeList table (on-screen in one-pager)
-    def build_final_safest_first_safelist(
-    safe_source_path: str | Path = "do_not_apply.csv",
-    avoid_pairs_path: str | Path = "avoid_pairs.csv",
-    seq_path: str | Path = "recommender_sequence.csv",  # optional for elim tiebreaker
-    out_basename: str = "final_safe_safest_first",
-) -> Optional[Dict[str, object]]:
-    """
-    SAFEST-FIRST list:
-      1) Take ONLY SAFE rows from do_not_apply.csv
-      2) Drop any filter that appears even once in avoid_pairs.csv (either column)
-      3) Ignore sequence order. Sort by:
-           (risk ASC), (support DESC), (eliminations DESC if available from sequence)
-      4) Write CSV/TXT/HTML and return metadata
-    """
-    safe_source_path  = Path(safe_source_path)
-    avoid_pairs_path  = Path(avoid_pairs_path)
-    seq_path          = Path(seq_path)
-
-    if not safe_source_path.exists() or not avoid_pairs_path.exists():
-        return None
-
-    safe_df = pd.read_csv(safe_source_path)
-    tier_col = _detect_col(safe_df, ["tier", "Tier", "TIER"])
-    fid_col  = _detect_col(safe_df, ["filter_id", "Filter ID", "FILTER_ID", "fid", "FID", "id"])
-    if not tier_col or not fid_col:
-        return None
-
-    safe_df[fid_col] = safe_df[fid_col].astype(str).str.strip()
-    safe_only = safe_df[safe_df[tier_col].astype(str).str.upper() == "SAFE"].copy()
-    safe_ids = set(safe_only[fid_col])
-
-    # metrics for sort
-    metrics = (
-        safe_only.rename(columns={fid_col: "filter_id"})
-        .drop_duplicates("filter_id")
-        .set_index("filter_id")
-    )
-
-    # Avoid pairs drop
-    ap_df = pd.read_csv(avoid_pairs_path)
-    fid1 = _detect_col(ap_df, ["filter_id_1", "FID1", "fid1"])
-    fid2 = _detect_col(ap_df, ["filter_id_2", "FID2", "fid2"])
-    if not fid1 or not fid2:
-        return None
-    ap_ids = set(ap_df[fid1].astype(str).str.strip()) | set(ap_df[fid2].astype(str).str.strip())
-
-    revised_safe_ids = [fid for fid in safe_ids if fid not in ap_ids]
-
-    # Optional: elimination counts from sequence as a tiebreaker
-    elim_map: Dict[str, float] = {}
-    if seq_path.exists():
-        try:
-            seq_df = pd.read_csv(seq_path)
-            seq_fid = _detect_col(seq_df, ["filter_id", "Filter ID", "FILTER_ID", "fid", "FID", "id"])
-            elim_col = _detect_col(seq_df, ["eliminated_now", "eliminations", "elim_count", "elimination_count", "elims"])
-            if seq_fid and elim_col:
-                elim_map = dict(zip(
-                    seq_df[seq_fid].astype(str).str.strip(),
-                    pd.to_numeric(seq_df[elim_col], errors="coerce").fillna(0.0)
-                ))
-        except Exception:
-            elim_map = {}
-
-    def risk_of(fid: str) -> float:
-        try: return float(metrics.loc[fid, "risk"])
-        except Exception: return 1e9
-
-    def support_of(fid: str) -> float:
-        try: return float(metrics.loc[fid, "support"])
-        except Exception: return -1e9
-
-    def elims_of(fid: str) -> float:
-        try: return float(elim_map.get(fid, 0.0))
-        except Exception: return 0.0
-
-    ordered = sorted(
-        revised_safe_ids,
-        key=lambda fid: (risk_of(fid), -support_of(fid), -elims_of(fid))
-    )
-
-    # Outputs
-    from datetime import datetime
-    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    base = f"{out_basename}_{ts}"
-    out_csv = OUTPUT_DIR / f"{base}.csv"
-    out_txt = OUTPUT_DIR / f"{base}.txt"
-    out_html = OUTPUT_DIR / f"{base}.html"
-
-    final_df = pd.DataFrame({"filter_id": ordered})
-    if not metrics.empty:
-        final_df = final_df.merge(metrics.reset_index(), on="filter_id", how="left")
-
-    final_df.to_csv(out_csv, index=False)
-    with open(out_txt, "w", encoding="utf-8") as f:
-        for fid in ordered:
-            f.write(f"{fid}\n")
-    final_df.to_html(out_html, index=False, escape=False)
-
-    return {
-        "counts": {
-            "safe_only": len(safe_ids),
-            "revised_safe": len(revised_safe_ids),
-            "final_total": len(ordered),
-        },
-        "outputs": {"csv": str(out_csv), "txt": str(out_txt), "html": str(out_html)},
-        "order_mode": "safest_first",
-    }
-
-    final_safe_html = ""
-    if final_safe_meta and final_safe_meta.get("outputs", {}).get("csv"):
-        try:
-            final_csv = final_safe_meta["outputs"]["csv"]
-            fs_df = pd.read_csv(final_csv)
-            # Show the entire list (cap at 400 rows to keep page usable)
-            cap = 400 if len(fs_df) > 400 else None
-            final_safe_html = df_to_html_table(fs_df, [], "Final Ordered SafeList is empty.", cap)
-        except Exception:
-            final_safe_html = "<p class='muted mono'>Final Ordered SafeList written, but failed to render table preview.</p>"
-    else:
-        final_safe_html = "<p class='muted mono'>Final Ordered SafeList not built (missing inputs).</p>"
-
-    html_doc = HTML_CSS + snap + \
-        "<div class='card'><h2>Apply in this order (winner-preserving)</h2>{}</div>".format(applied_html) + \
-        "<div class='card'><h2>Skipped steps</h2>{}</div>".format(skipped_html) + \
-        "<div class='card'><h2>Avoid combining (today’s bucket)</h2>{}</div>".format(avoid_html) + \
-        (("<div class='card'><h2>Today — historically safe filter pairs (NoPool)</h2>{}</div>".format(nopool_html)) if include_nopool_panel else "") + \
-        "<div class='card'><h2>Final Ordered SafeList</h2>{}</div>".format(final_safe_html) + \
+    html_doc = (
+        HTML_CSS + snap +
+        "<div class='card'><h2>Apply in this order (winner-preserving)</h2>{}</div>".format(applied_html) +
+        "<div class='card'><h2>Skipped steps</h2>{}</div>".format(skipped_html) +
+        "<div class='card'><h2>Avoid combining (today’s bucket)</h2>{}</div>".format(avoid_html) +
+        ("<div class='card'><h2>Today — historically safe filter pairs (NoPool)</h2>{}</div>".format(
+            df_to_html_table(
+                nopool_df,
+                ["Filter A ID","Filter B ID","Days both applicable (history)","Winner kept % (both applicable)","Either blocks winner %","Both block winner %","Parity note (only if meaningful)"],
+                f"No historical pairs meet thresholds (min_days={NOPOOL_MIN_DAYS}, min_keep={NOPOOL_MIN_KEEP}%).",
+                NOPOOL_MAX_ROWS
+            )
+        ) if include_nopool_panel else "") +
+        "<div class='card'><h2>Final Ordered SafeList (sequence-respecting)</h2>{}</div>".format(final_html) +
+        "<div class='card'><h2>Final SafeList — Safest-first (risk↑, support↓, eliminations↓)</h2>{}</div>".format(safest_html) +
         "</div></body></html>"
+    )
 
     (OUTPUT_DIR / "one_pager.html").write_text(html_doc, encoding="utf-8")
     return seq_rows
@@ -1058,7 +973,8 @@ __all__ = [
     "WINNERS_CSV","FILTERS_CSV","TODAY_POOL_CSV","OUTPUT_DIR",
     "TARGET_MAX","ALWAYS_KEEP_WINNER","MINIMIZE_BEYOND_TARGET",
     "AFFINITY_EXCLUDE_TOP_PCT",
-    "main","combo_affinity","get_pool_for_seed","nopool_today_pairs","build_final_ordered_safelist"
+    "main","combo_affinity","get_pool_for_seed","nopool_today_pairs",
+    "build_final_ordered_safelist","build_final_safest_first_safelist"
 ]
 
 if __name__ == "__main__":
