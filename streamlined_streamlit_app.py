@@ -2,8 +2,8 @@ import streamlit as st
 import pandas as pd
 from pathlib import Path
 
-# Import recommender entrypoint
-from recommender import main as run_recommender
+# Import recommender entrypoint lazily later (so the app still loads if missing)
+# from recommender import main as run_recommender
 
 # ========================
 # Paths (repo-root relative)
@@ -16,6 +16,7 @@ CASE_STATS      = "case_filter_stats.csv"
 OUT_DIR         = Path(".")
 
 st.set_page_config(page_title="DCS Recommender — Streamlined", layout="wide")
+
 # ---------- helpers ----------
 
 def _fmt_dt(path: Path) -> str:
@@ -50,7 +51,7 @@ with st.expander("Step 1 — Build or update case tables (Profiler)", expanded=T
         if st.button("Incremental refresh now", type="primary"):
             try:
                 from profiler import refresh_incremental
-            except Exception as e:
+            except Exception:
                 st.error("Profiler module not found. Ensure **profiler.py** is in the repo.")
             else:
                 try:
@@ -62,7 +63,7 @@ with st.expander("Step 1 — Build or update case tables (Profiler)", expanded=T
         if st.button("Full rebuild now"):
             try:
                 from profiler import build_case_history
-            except Exception as e:
+            except Exception:
                 st.error("Profiler module not found. Ensure **profiler.py** is in the repo.")
             else:
                 try:
@@ -105,6 +106,7 @@ if submitted:
     if invalids:
         st.error("Validation failed:\n" + "\n".join(invalids))
     else:
+        ids = [x.strip() for x in applicable_ids.replace("\n", ",").replace(" ", ",").split(",") if x.strip()]
         kwargs = dict(
             winners_csv=winners_csv,
             filters_csv=filters_csv,
@@ -115,8 +117,10 @@ if submitted:
             override_seed=seed or None,
             override_prev=prev_seed or None,
             override_prevprev=prev_prev_seed or None,
-            applicable_only=[x.strip() for x in applicable_ids.replace("\n", ",").replace(" ", ",").split(",") if x.strip()],
+            applicable_only=ids or None,
         )
+
+        # Import recommender safely
         try:
             from recommender import main as run_recommender
         except Exception:
@@ -125,41 +129,48 @@ if submitted:
             try:
                 result = run_recommender(**kwargs)
                 st.success("✅ Recommender finished")
-                from pathlib import Path
-import pandas as pd
-st.success("Recommender finished")
 
-p = Path("NoPool_today_pairs_TOP.csv")
-if p.exists():
-    try:
-        df = pd.read_csv(p)
-        if df.empty:
-            st.info("No additional NoPool recommendations today "
-                    "(min_days=60, min_keep=75%). "
-                    "See one_pager.html for details.")
-        else:
-            st.success(f"NoPool recommendations ready: {len(df)} pair(s). "
-                       "Open one_pager.html for details.")
-    except Exception:
-        st.warning("NoPool summary file not readable. Check logs / one_pager.html.")
-else:
-    st.info("NoPool summary file not found. (Feature may be disabled or no pairs applied.)")
-
-                # show sequence if written; otherwise show returned structure
-                if isinstance(result, (list, tuple, dict)):
-                    st.dataframe(pd.DataFrame(result))
+                # ---- Additional NoPool panel ----
+                nopool_csv = Path("NoPool_today_pairs_TOP.csv")
+                if nopool_csv.exists():
+                    try:
+                        df_np = pd.read_csv(nopool_csv)
+                        if df_np.empty:
+                            st.info("No additional NoPool recommendations today (min_days=60, min_keep=75%). See one_pager.html for details.")
+                        else:
+                            st.success(f"Additional NoPool recommendations: {len(df_np)} pair(s). See one_pager.html for details.")
+                            st.dataframe(df_np.head(20), use_container_width=True)
+                    except Exception as e:
+                        st.warning(f"Could not read {nopool_csv.name}: {e}")
                 else:
-                    # try to display CSVs produced by recommender
-                    for f in ["recommender_sequence.csv", "pool_reduction_log.csv", "avoid_pairs.csv", "do_not_apply.csv", "one_pager.md"]:
-                        p = OUT_DIR / f
-                        if p.exists():
-                            st.write(f"**{f}** — updated {_fmt_dt(p)}")
-                            if p.suffix == ".md":
-                                st.markdown(p.read_text(encoding="utf-8"))
-                            else:
-                                try:
-                                    st.dataframe(pd.read_csv(p))
-                                except Exception:
-                                    st.code(p.read_text(encoding="utf-8").strip()[:5000])
+                    st.info("NoPool summary file not found. (Feature may be off or no pairs qualified.)")
+
+                # ---- Show outputs if present ----
+                outputs = [
+                    "recommender_sequence.csv",
+                    "pool_reduction_log.csv",
+                    "avoid_pairs.csv",
+                    "do_not_apply.csv",
+                    "one_pager.md",
+                    "one_pager.html",
+                ]
+                for fname in outputs:
+                    p = OUT_DIR / fname
+                    if p.exists():
+                        st.write(f"**{fname}** — updated {_fmt_dt(p)}")
+                        if p.suffix == ".md":
+                            st.markdown(p.read_text(encoding="utf-8"))
+                        elif p.suffix == ".html":
+                            st.download_button(
+                                "Download one_pager.html",
+                                data=p.read_bytes(),
+                                file_name="one_pager.html",
+                            )
+                        else:
+                            try:
+                                st.dataframe(pd.read_csv(p), use_container_width=True)
+                            except Exception:
+                                st.code(p.read_text(encoding='utf-8')[:5000])
+
             except Exception as e:
                 st.exception(e)
