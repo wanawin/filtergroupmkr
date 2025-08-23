@@ -239,10 +239,6 @@ def load_filters(path: str) -> List[FilterDef]:
 # Affinity (used ONLY to rank by similarity for pre-trim)
 # =============================================================================
 def combo_affinity(env_now: Dict[str, object], combo: str) -> float:
-    """
-    Deterministic similarity score used only for ranking within today's pool.
-    Higher = 'more similar' to seed. We will DROP the top X% (anti-affinity).
-    """
     cd = digits_of(combo)
     seedd = env_now["seed_digits_list"]
     combo_sum, seed_sum = sum(cd), env_now["seed_sum"]
@@ -363,6 +359,188 @@ def apply_filter_to_pool(f: FilterDef, base_env: Dict[str,object], pool: List[st
     return keep, elim
 
 # =============================================================================
+# Archetype stats (NEW)
+# =============================================================================
+def _combo_has_dupe(digs: List[int]) -> int:
+    return 1 if max(Counter(digs).values()) >= 2 else 0
+
+def _combo_has_low_high(digs: List[int]) -> int:
+    has_low = any(d <= 4 for d in digs)
+    has_high = any(d >= 5 for d in digs)
+    return 1 if (has_low and has_high) else 0
+
+def archetype_stats_today_applicable(
+    winners: List[str],
+    filters_all: Dict[str, FilterDef],
+    idx_now: int,
+) -> Dict[str, str]:
+    """
+    For today's applicable filters only, compute historical winner-kept% by:
+      - Single features: seedOverlap, dupe, parMaj, LHmix, sum
+      - All feature PAIRS among those 5
+      - Three fixed 3-feature clusters (C1, C2, C3)
+    Writes three CSVs and returns their paths.
+    """
+    N = idx_now
+    if N < 2:
+        return {}
+
+    # Build envs for history days 1..idx_now
+    envs = [build_env_for_draw(i, winners) for i in range(1, idx_now+1)]
+    env_now = envs[-1]
+    todays_ids = [fid for fid, f in filters_all.items() if safe_eval(f.applicable_if, env_now)]
+    if not todays_ids:
+        return {}
+
+    # Compile expressions for today's set only
+    f_slice = {fid: filters_all[fid] for fid in todays_ids}
+    comp_app, comp_blk = {}, {}
+    for fid, f in f_slice.items():
+        try:  comp_app[fid] = compile(f.applicable_if if f.applicable_if else "True", "<app_if>", "eval")
+        except Exception: comp_app[fid] = compile("False", "<app_if>", "eval")
+        try:  comp_blk[fid] = compile(f.expression if f.expression else "False", "<expr>", "eval")
+        except Exception: comp_blk[fid] = compile("False", "<expr>", "eval")
+
+    F = len(f_slice)
+    idx_map = {fid:i for i,fid in enumerate(todays_ids)}
+    app = np.zeros((N, F), dtype=bool)
+    blk = np.zeros((N, F), dtype=bool)
+
+    # Precompute applicability & blocking across history
+    for i, env in enumerate(envs):
+        for fid in todays_ids:
+            j = idx_map[fid]
+            try:
+                a = bool(eval(comp_app[fid], {"__builtins__": {}}, env))
+            except Exception:
+                a = False
+            app[i, j] = a
+            if a:
+                try:
+                    b = bool(eval(comp_blk[fid], {"__builtins__": {}}, env))
+                except Exception:
+                    b = False
+                blk[i, j] = b
+
+    # Feature extraction per day
+    def features_for_env(env: Dict[str, object]):
+        digs = env["combo_digits_list"]
+        seedd = env["seed_digits_list"]
+        feats = {
+            "seedOverlap": 1 if len(set(digs) & set(seedd)) >= 1 else 0,
+            "dupe": _combo_has_dupe(digs),
+            "parMaj": _parity_major_label(digs),
+            "LHmix": _combo_has_low_high(digs),
+            "sum": env["combo_sum_category"],
+        }
+        return feats
+
+    # Accumulators
+    from collections import defaultdict
+    single_counts = defaultdict(lambda: [0,0])  # (feature, value, fid) -> [app, kept]
+    pair_counts   = defaultdict(lambda: [0,0])  # (fa,va, fb,vb, fid)
+    triple_counts = defaultdict(lambda: [0,0])  # (cluster, key, fid)
+
+    single_names = ["seedOverlap", "dupe", "parMaj", "LHmix", "sum"]
+    pair_names = list(it.combinations(single_names, 2))
+    triple_clusters = [
+        ("C1", ("seedOverlap","dupe","parMaj")),
+        ("C2", ("seedOverlap","LHmix","sum")),
+        ("C3", ("dupe","parMaj","sum")),
+    ]
+
+    for i, env in enumerate(envs):
+        feats = features_for_env(env)
+        # build pair values for this day
+        pair_vals = {p: (feats[p[0]], feats[p[1]]) for p in pair_names}
+        triple_vals = {}
+        for cname, trio in triple_clusters:
+            key = "|".join([f"{n}={feats[n]}" for n in trio])
+            triple_vals[(cname, trio)] = key
+
+        for fid in todays_ids:
+            j = idx_map[fid]
+            if not app[i, j]:
+                continue
+            kept = (not blk[i, j])
+
+            # Singles
+            for n in single_names:
+                k = (n, feats[n], fid)
+                single_counts[k][0] += 1
+                single_counts[k][1] += int(kept)
+
+            # Pairs
+            for (a,b), (va, vb) in pair_vals.items():
+                k2 = (a, va, b, vb, fid)
+                pair_counts[k2][0] += 1
+                pair_counts[k2][1] += int(kept)
+
+            # Triples
+            for (cname, trio), key in triple_vals.items():
+                kt = (cname, key, fid)
+                triple_counts[kt][0] += 1
+                triple_counts[kt][1] += int(kept)
+
+    # Build DataFrames
+    def to_df_single():
+        recs = []
+        for (feat, val, fid), (n, k) in single_counts.items():
+            if n == 0: continue
+            recs.append({
+                "feature": feat, "value": val, "filter_id": fid,
+                "days_applicable": n, "winner_kept": k,
+                "winner_kept_pct": round(100.0 * k / n, 3)
+            })
+        df = pd.DataFrame(recs)
+        if not df.empty:
+            df = df.sort_values(["winner_kept_pct","days_applicable","feature","value","filter_id"],
+                                ascending=[False, False, True, True, True])
+        return df
+
+    def to_df_pair():
+        recs = []
+        for (fa, va, fb, vb, fid), (n, k) in pair_counts.items():
+            if n == 0: continue
+            recs.append({
+                "feature_a": fa, "value_a": va, "feature_b": fb, "value_b": vb,
+                "filter_id": fid, "days_applicable": n, "winner_kept": k,
+                "winner_kept_pct": round(100.0 * k / n, 3)
+            })
+        df = pd.DataFrame(recs)
+        if not df.empty:
+            df = df.sort_values(["winner_kept_pct","days_applicable","feature_a","feature_b","filter_id"],
+                                ascending=[False, False, True, True, True])
+        return df
+
+    def to_df_triple():
+        recs = []
+        for (cluster, key, fid), (n, k) in triple_counts.items():
+            if n == 0: continue
+            recs.append({
+                "cluster": cluster, "key": key, "filter_id": fid,
+                "days_applicable": n, "winner_kept": k,
+                "winner_kept_pct": round(100.0 * k / n, 3)
+            })
+        df = pd.DataFrame(recs)
+        if not df.empty:
+            df = df.sort_values(["cluster","winner_kept_pct","days_applicable","filter_id"],
+                                ascending=[True, False, False, True])
+        return df
+
+    df_single = to_df_single()
+    df_pair   = to_df_pair()
+    df_triple = to_df_triple()
+
+    p_single = OUTPUT_DIR / "archetypes_single.csv"
+    p_pair   = OUTPUT_DIR / "archetypes_pairs.csv"
+    p_triple = OUTPUT_DIR / "archetypes_triples.csv"
+    if df_single is not None: df_single.to_csv(p_single, index=False)
+    if df_pair is not None:   df_pair.to_csv(p_pair, index=False)
+    if df_triple is not None: df_triple.to_csv(p_triple, index=False)
+    return {"single": str(p_single), "pairs": str(p_pair), "triples": str(p_triple)}
+
+# =============================================================================
 # NoPool (historical signals without pool) — TODAY'S applicable pairs only
 # =============================================================================
 def nopool_today_pairs(
@@ -467,10 +645,6 @@ def build_final_ordered_safelist(
     seq_path: str | Path = "recommender_sequence.csv",
     out_basename: str = "final_safe_ordered",
 ) -> Optional[Dict[str, object]]:
-    """
-    SAFE only (from do_not_apply.csv) → drop anything seen in avoid_pairs.csv → 
-    order by recommender_sequence.csv (keep all revised safelist items).
-    """
     safe_source_path  = Path(safe_source_path)
     avoid_pairs_path  = Path(avoid_pairs_path)
     seq_path          = Path(seq_path)
@@ -571,9 +745,6 @@ def build_final_safest_first_safelist(
     seq_path: str | Path = "recommender_sequence.csv",  # optional for elim tiebreak
     out_basename: str = "final_safe_safest_first",
 ) -> Optional[Dict[str, object]]:
-    """
-    SAFE only → minus avoid_pairs → ignore sequence; sort by (risk ASC, support DESC, elim DESC if present).
-    """
     safe_source_path  = Path(safe_source_path)
     avoid_pairs_path  = Path(avoid_pairs_path)
     seq_path          = Path(seq_path)
@@ -665,11 +836,6 @@ def build_final_grouped_by_aggression_on_pool(
     avoid_pairs_path: str | Path = "avoid_pairs.csv",
     out_basename: str = "final_safe_grouped",
 ) -> Optional[Dict[str, object]]:
-    """
-    SAFE only → minus avoid_pairs → for each filter compute elim_count on the *baseline pool* (applied solo),
-    bucket by elim_count (701+, 501–700, 301–500, 101–300, 61–100, 1–60, 0), and within each bucket
-    sort by (risk ASC, support DESC, elim_count DESC). Write CSV/TXT/HTML.
-    """
     safe_source_path  = Path(safe_source_path)
     avoid_pairs_path  = Path(avoid_pairs_path)
     if not safe_source_path.exists() or not avoid_pairs_path.exists():
@@ -847,7 +1013,7 @@ def main(
     if pool and (0.0 < pct < 1.0):
         aff = np.array([combo_affinity(env_now, c) for c in pool], dtype=float)
         ranks = pd.Series(aff).rank(method="average", ascending=True)
-        thr = 1.0 - pct                     # drop top X%  ≡ aff_pct >= thr
+        thr = 1.0 - pct
         aff_pct = (ranks - 1) / max(len(pool) - 1, 1)
         keep_mask = aff_pct < thr
         new_pool = [c for c, keep in zip(pool, keep_mask) if keep]
@@ -939,6 +1105,9 @@ def main(
         )
         do_not_df.to_csv(OUTPUT_DIR / "do_not_apply.csv", index=False)
 
+    # ===== Archetype CSVs (NEW) =====
+    _ = archetype_stats_today_applicable(winners, filters_map, idx_now)
+
     # ===== NoPool panel (today’s historically safe pairs) =====
     if include_nopool_panel:
         _ = nopool_today_pairs(
@@ -971,7 +1140,7 @@ def main(
         out_basename="final_safe_grouped",
     )
 
-    # ===== One-pager (very small snapshot) =====
+    # ===== One-pager (tiny snapshot) =====
     seed_list = base_env['seed_digits_list']
     parity_major = "even>=3" if sum(1 for d in seed_list if d%2==0) >= 3 else "even<=2"
 
@@ -988,8 +1157,7 @@ h2 { font-size: 18px; margin: 24px 0 8px; }
 .table th, .table td { text-align:left; padding:8px 10px; border-bottom:1px solid #e5e7eb; }
 .table th { background:#f8fafc; font-weight:700; }
 .kpi { background:#f8fafc; padding:8px 10px; border-radius:12px; border:1px solid #e2e8f0; display:inline-block; margin-right:8px; }
-.badge { display:inline-block; padding:6px 10px; border-radius:12px; background:#eef2ff; margin-right:8px; }
-.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Courier New", monospace; }
 </style></head><body><div class='wrap'>"""
 
     applied = seq_df[seq_df["eliminated_now"].notna() & (seq_df["eliminated_now"]>0)]
@@ -999,7 +1167,9 @@ h2 { font-size: 18px; margin: 24px 0 8px; }
         "· <b>Structure:</b> {} · <b>Spread:</b> {} · <b>Parity:</b> {}</div>"
         "<div style='margin-top:8px'><span class='kpi'>Anti-affinity default: drop top {}%</span></div>"
         "<div style='margin-top:8px'><span class='kpi'>Applicable filters: {}</span>"
-        "<span class='kpi'>Final size: {}</span></div></div>"
+        "<span class='kpi'>Final size: {}</span></div>"
+        "<div style='margin-top:8px' class='mono'>Archetype CSVs: archetypes_single.csv, archetypes_pairs.csv, archetypes_triples.csv</div>"
+        "</div>"
     ).format(
         html.escape(str(base_env['seed'])),
         base_env['seed_sum'], html.escape(base_env['seed_sum_category']),
@@ -1012,7 +1182,7 @@ h2 { font-size: 18px; margin: 24px 0 8px; }
 
     def df_to_html_table(df: pd.DataFrame, columns: list, empty_msg: str, limit: int = None):
         if df is None or df.empty:
-            return "<p class='muted mono'>{}</p>".format(html.escape(empty_msg))
+            return "<p class='mono'>{}</p>".format(html.escape(empty_msg))
         use = df[columns].copy() if columns else df.copy()
         if limit: use = use.head(limit)
         return use.to_html(index=False, classes="table", border=0, escape=True)
@@ -1033,7 +1203,7 @@ __all__ = [
     "AFFINITY_EXCLUDE_TOP_PCT",
     "main","combo_affinity","get_pool_for_seed","nopool_today_pairs",
     "build_final_ordered_safelist","build_final_safest_first_safelist",
-    "build_final_grouped_by_aggression_on_pool"
+    "build_final_grouped_by_aggression_on_pool","archetype_stats_today_applicable"
 ]
 
 if __name__ == "__main__":
