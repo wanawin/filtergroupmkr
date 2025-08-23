@@ -922,6 +922,114 @@ h2 { font-size: 18px; margin: 24px 0 8px; }
                                        NOPOOL_MAX_ROWS)
 
     # Final Ordered SafeList table (on-screen in one-pager)
+    def build_final_safest_first_safelist(
+    safe_source_path: str | Path = "do_not_apply.csv",
+    avoid_pairs_path: str | Path = "avoid_pairs.csv",
+    seq_path: str | Path = "recommender_sequence.csv",  # optional for elim tiebreaker
+    out_basename: str = "final_safe_safest_first",
+) -> Optional[Dict[str, object]]:
+    """
+    SAFEST-FIRST list:
+      1) Take ONLY SAFE rows from do_not_apply.csv
+      2) Drop any filter that appears even once in avoid_pairs.csv (either column)
+      3) Ignore sequence order. Sort by:
+           (risk ASC), (support DESC), (eliminations DESC if available from sequence)
+      4) Write CSV/TXT/HTML and return metadata
+    """
+    safe_source_path  = Path(safe_source_path)
+    avoid_pairs_path  = Path(avoid_pairs_path)
+    seq_path          = Path(seq_path)
+
+    if not safe_source_path.exists() or not avoid_pairs_path.exists():
+        return None
+
+    safe_df = pd.read_csv(safe_source_path)
+    tier_col = _detect_col(safe_df, ["tier", "Tier", "TIER"])
+    fid_col  = _detect_col(safe_df, ["filter_id", "Filter ID", "FILTER_ID", "fid", "FID", "id"])
+    if not tier_col or not fid_col:
+        return None
+
+    safe_df[fid_col] = safe_df[fid_col].astype(str).str.strip()
+    safe_only = safe_df[safe_df[tier_col].astype(str).str.upper() == "SAFE"].copy()
+    safe_ids = set(safe_only[fid_col])
+
+    # metrics for sort
+    metrics = (
+        safe_only.rename(columns={fid_col: "filter_id"})
+        .drop_duplicates("filter_id")
+        .set_index("filter_id")
+    )
+
+    # Avoid pairs drop
+    ap_df = pd.read_csv(avoid_pairs_path)
+    fid1 = _detect_col(ap_df, ["filter_id_1", "FID1", "fid1"])
+    fid2 = _detect_col(ap_df, ["filter_id_2", "FID2", "fid2"])
+    if not fid1 or not fid2:
+        return None
+    ap_ids = set(ap_df[fid1].astype(str).str.strip()) | set(ap_df[fid2].astype(str).str.strip())
+
+    revised_safe_ids = [fid for fid in safe_ids if fid not in ap_ids]
+
+    # Optional: elimination counts from sequence as a tiebreaker
+    elim_map: Dict[str, float] = {}
+    if seq_path.exists():
+        try:
+            seq_df = pd.read_csv(seq_path)
+            seq_fid = _detect_col(seq_df, ["filter_id", "Filter ID", "FILTER_ID", "fid", "FID", "id"])
+            elim_col = _detect_col(seq_df, ["eliminated_now", "eliminations", "elim_count", "elimination_count", "elims"])
+            if seq_fid and elim_col:
+                elim_map = dict(zip(
+                    seq_df[seq_fid].astype(str).str.strip(),
+                    pd.to_numeric(seq_df[elim_col], errors="coerce").fillna(0.0)
+                ))
+        except Exception:
+            elim_map = {}
+
+    def risk_of(fid: str) -> float:
+        try: return float(metrics.loc[fid, "risk"])
+        except Exception: return 1e9
+
+    def support_of(fid: str) -> float:
+        try: return float(metrics.loc[fid, "support"])
+        except Exception: return -1e9
+
+    def elims_of(fid: str) -> float:
+        try: return float(elim_map.get(fid, 0.0))
+        except Exception: return 0.0
+
+    ordered = sorted(
+        revised_safe_ids,
+        key=lambda fid: (risk_of(fid), -support_of(fid), -elims_of(fid))
+    )
+
+    # Outputs
+    from datetime import datetime
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    base = f"{out_basename}_{ts}"
+    out_csv = OUTPUT_DIR / f"{base}.csv"
+    out_txt = OUTPUT_DIR / f"{base}.txt"
+    out_html = OUTPUT_DIR / f"{base}.html"
+
+    final_df = pd.DataFrame({"filter_id": ordered})
+    if not metrics.empty:
+        final_df = final_df.merge(metrics.reset_index(), on="filter_id", how="left")
+
+    final_df.to_csv(out_csv, index=False)
+    with open(out_txt, "w", encoding="utf-8") as f:
+        for fid in ordered:
+            f.write(f"{fid}\n")
+    final_df.to_html(out_html, index=False, escape=False)
+
+    return {
+        "counts": {
+            "safe_only": len(safe_ids),
+            "revised_safe": len(revised_safe_ids),
+            "final_total": len(ordered),
+        },
+        "outputs": {"csv": str(out_csv), "txt": str(out_txt), "html": str(out_html)},
+        "order_mode": "safest_first",
+    }
+
     final_safe_html = ""
     if final_safe_meta and final_safe_meta.get("outputs", {}).get("csv"):
         try:
