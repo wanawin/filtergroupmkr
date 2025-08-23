@@ -258,4 +258,1044 @@ def combo_affinity(env_now: Dict[str, object], combo: str) -> float:
 
     hi8_seed = sum(1 for d in seedd if d >= 8)
     hi8_combo = sum(1 for d in cd if d >= 8)
-    if
+    if hi8_seed >= 3:
+        hi8_score = math.exp(-max(0, hi8_combo - 1))
+    else:
+        hi8_score = math.exp(-abs(hi8_combo - hi8_seed) / 1.5)
+
+    overlap = len(set(seedd) & set(cd))
+    overlap_eq1 = 1.0 if overlap == 1 else 0.0
+
+    W_SUM, W_SPD, W_STR, W_PAR, W_HI8, W_OV1 = 0.8, 0.3, 0.4, 0.15, 0.35, 0.25
+    return (
+        W_SUM * sum_prox + W_SPD * spread_prox + W_STR * struct_match +
+        W_PAR * parity_match + W_HI8 * hi8_score + W_OV1 * overlap_eq1
+    )
+
+# =============================================================================
+# Risk (history-only) + helpers
+# =============================================================================
+def safe_eval(expr: str, env: Dict[str, object]) -> bool:
+    if not expr:
+        return True
+    try:
+        return bool(eval(expr, {"__builtins__": {}}, env))
+    except Exception:
+        return False
+
+def historical_risk_for_applicable(
+    filters: List[FilterDef],
+    winners: List[str],
+    idx_now: int,
+    max_draws: Optional[int] = None,
+    max_bucket_matches: Optional[int] = None,
+    decay_half_life: Optional[int] = None,
+):
+    env_now = build_env_for_draw(idx_now, winners)
+
+    start_idx = max(1, (idx_now - (max_draws or (idx_now - 1))))
+    candidate_indices = list(range(start_idx, idx_now))
+
+    def w(i: int) -> float:
+        if not decay_half_life:
+            return 1.0
+        age = (idx_now - i)
+        return 0.5 ** (age / float(decay_half_life))
+
+    app_w = Counter()
+    blk_w = Counter()
+    coapp = Counter()
+    both_block = Counter()
+
+    for i in candidate_indices:
+        env_i = build_env_for_draw(i, winners)
+        applicable_ids = []
+        blocked_ids = []
+        wi = w(i)
+        for f in filters:
+            if not f.enabled:
+                continue
+            if safe_eval(f.applicable_if, env_i):
+                applicable_ids.append(f.fid)
+                app_w[f.fid] += wi
+                if safe_eval(f.expression, env_i):
+                    blk_w[f.fid] += wi
+                    blocked_ids.append(f.fid)
+        for a,b in it.combinations(sorted(applicable_ids), 2):
+            coapp[(a,b)] += 1
+        for a,b in it.combinations(sorted(blocked_ids), 2):
+            both_block[(a,b)] += 1
+
+    single_failure_rate = {fid: (blk_w[fid]/app_w[fid]) if app_w[fid] > 0 else 0.0 for fid in app_w}
+    pair_risk = {}
+    for (a,b), n in coapp.items():
+        bb = both_block.get((a,b), 0)
+        pair_risk[(a,b)] = bb / n if n > 0 else 0.0
+    return single_failure_rate, pair_risk, candidate_indices
+
+def today_applicable_filters(filters: List[FilterDef], winners: List[str]):
+    if len(winners) < 2:
+        raise SystemExit("Need at least 2 winners.")
+    idx_now = len(winners) - 1
+    env_now = build_env_for_draw(idx_now, winners)
+    app: Dict[str, FilterDef] = {}
+    for f in filters:
+        if f.enabled and safe_eval(f.applicable_if, env_now):
+            app[f.fid] = f
+    return idx_now, app, env_now
+
+def apply_filter_to_pool(f: FilterDef, base_env: Dict[str,object], pool: List[str]) -> Tuple[List[str], int]:
+    keep, elim = [], 0
+    for s in pool:
+        clist = sorted(digits_of(s))
+        env = dict(base_env)
+        env.update({
+            "combo": s,
+            "combo_digits": set(clist),
+            "combo_digits_list": clist,
+            "combo_sum": sum(clist),
+            "combo_sum_cat": sum_category(sum(clist)),
+            "combo_sum_category": sum_category(sum(clist)),
+            "spread_combo": max(clist) - min(clist),
+            "combo_vtracs": set(VTRAC[d] for d in clist),
+        })
+        if safe_eval(f.applicable_if, env) and safe_eval(f.expression, env):
+            elim += 1
+        else:
+            keep.append(s)
+    return keep, elim
+
+# =============================================================================
+# Archetypes — keys, clusters, and conditioned risks
+# =============================================================================
+def _archetype_from_env(env: Dict[str, object]) -> Tuple[str, str, str]:
+    """Return archetype key and two cluster labels (shape, mass)."""
+    seed_d = env["seed_digits_list"]
+    combo_d = env["combo_digits_list"]
+
+    ov = 1 if len(set(seed_d) & set(combo_d)) >= 1 else 0
+    lohi = 1 if (min(combo_d) <= 4 and max(combo_d) >= 5) else 0
+    par = _parity_major_label(combo_d)           # e.g., '3E2O'
+    spd = spread_band(env["spread_combo"])       # '6-7' etc.
+    sm  = sum_category(env["combo_sum"])         # Very Low/Low/Mid/High
+    st  = classify_structure(combo_d)            # double, triple, etc.
+    dup = 1 if len(set(combo_d)) < 5 else 0
+
+    # Full archetype (fine-grained)
+    key = f"ov={ov}|lh={lohi}|par={par}|sum={sm}|spd={spd}|struct={st}|dup={dup}"
+    # Cluster-2 (shape): parity + lohi + spread
+    c2  = f"par={par}|lh={lohi}|spd={spd}"
+    # Cluster-3 (mass): sum + structure
+    c3  = f"sum={sm}|struct={st}"
+    return key, c2, c3
+
+def _laplace(blk: float, app: float, k: float = 1.0, m: float = 2.0) -> float:
+    """(blk + k) / (app + m) — small smoothing so low-support buckets don't explode."""
+    return (float(blk) + k) / (float(app) + m) if (app + m) > 0 else 0.0
+
+def _weighted_mix(pairs: List[Tuple[float, float]]) -> float:
+    """
+    pairs: list of (weight, rate). Returns normalized weighted average.
+    Skips entries with zero/NaN weight.
+    """
+    num = 0.0; den = 0.0
+    for w, r in pairs:
+        if w and w > 0 and pd.notna(r):
+            num += w * r; den += w
+    return (num / den) if den > 0 else float("nan")
+
+def compute_archetype_tables_and_filter_risk(
+    winners: List[str],
+    filters_all: List[FilterDef],
+    idx_now: int,
+    applicable_today: Dict[str, FilterDef],
+    base_env: Dict[str, object],
+    base_pool: List[str],
+    *,
+    topk: int = 10
+) -> Dict[str, str]:
+    """
+    Produces:
+      - archetype_distribution_*.csv          (counts & shares of fine-grained archetypes)
+      - archetype_filter_risk_*.csv           (per-filter conditioned risks + safe_score + elim_count + group)
+    """
+    N = idx_now
+    # 1) Build envs and per-day keys
+    envs = [build_env_for_draw(i, winners) for i in range(1, idx_now+1)]
+    keys: List[str] = []
+    c2s:  List[str] = []
+    c3s:  List[str] = []
+    for e in envs:
+        k, c2, c3 = _archetype_from_env(e)
+        keys.append(k); c2s.append(c2); c3s.append(c3)
+
+    # 2) Global distribution of archetypes
+    key_counts = Counter(keys)
+    total_days = len(keys)
+    arc_df = pd.DataFrame(
+        [{"archetype": k, "count": n, "share_pct": round(100.0*n/total_days, 3)} for k, n in key_counts.most_common()]
+    )
+
+    # Focus: prefer archetypes with ov=1 & lh=1
+    arc_pref = [k for k, _ in key_counts.most_common() if "ov=1" in k and "lh=1" in k][:topk]
+    pref_weights = {k: key_counts[k] for k in arc_pref}
+    # normalize
+    s = float(sum(pref_weights.values())) or 1.0
+    pref_weights = {k: v/s for k, v in pref_weights.items()}
+
+    # 3) Build compiled expressions once
+    comp_app = {}
+    comp_blk = {}
+    for f in filters_all:
+        try:  comp_app[f.fid] = compile(f.applicable_if if f.applicable_if else "True", "<app_if>", "eval")
+        except Exception: comp_app[f.fid] = compile("False", "<app_if>", "eval")
+        try:  comp_blk[f.fid] = compile(f.expression if f.expression else "False", "<expr>", "eval")
+        except Exception: comp_blk[f.fid] = compile("False", "<expr>", "eval")
+
+    # 4) Tally: global, per-archetype, and cluster-2/cluster-3
+    app_g = Counter(); blk_g = Counter()
+    app_arc: Dict[Tuple[str, str], float] = Counter()  # (fid, archetype) -> app
+    blk_arc: Dict[Tuple[str, str], float] = Counter()
+    app_c2:  Dict[Tuple[str, str], float] = Counter()
+    blk_c2:  Dict[Tuple[str, str], float] = Counter()
+    app_c3:  Dict[Tuple[str, str], float] = Counter()
+    blk_c3:  Dict[Tuple[str, str], float] = Counter()
+
+    for e, k, c2, c3 in zip(envs, keys, c2s, c3s):
+        for f in filters_all:
+            if not f.enabled: 
+                continue
+            fid = f.fid
+            try:
+                a = bool(eval(comp_app[fid], {"__builtins__": {}}, e))
+            except Exception:
+                a = False
+            if not a:
+                continue
+            app_g[fid] += 1
+            app_arc[(fid, k)] += 1
+            app_c2[(fid, c2)] += 1
+            app_c3[(fid, c3)] += 1
+
+            try:
+                b = bool(eval(comp_blk[fid], {"__builtins__": {}}, e))
+            except Exception:
+                b = False
+            if b:
+                blk_g[fid] += 1
+                blk_arc[(fid, k)] += 1
+                blk_c2[(fid, c2)] += 1
+                blk_c3[(fid, c3)] += 1
+
+    # 5) Cluster distributions (weights) conditional on ov=1 & lh=1 days
+    mask_pref = [("ov=1" in k and "lh=1" in k) for k in keys]
+    c2_counts = Counter([c2 for c2, m in zip(c2s, mask_pref) if m])
+    c3_counts = Counter([c3 for c3, m in zip(c3s, mask_pref) if m])
+    s2 = float(sum(c2_counts.values())) or 1.0
+    s3 = float(sum(c3_counts.values())) or 1.0
+    c2_weights = {k: v/s2 for k, v in c2_counts.items()}
+    c3_weights = {k: v/s3 for k, v in c3_counts.items()}
+
+    # 6) Compute elim_count on the baseline pool for filters applicable TODAY
+    elim_counts: Dict[str, int] = {}
+    for fid, f in applicable_today.items():
+        _, elim = apply_filter_to_pool(f, base_env, base_pool)
+        elim_counts[fid] = int(elim)
+
+    # 7) Build output rows for applicable TODAY (others are irrelevant for sequencing)
+    rows = []
+    for fid, f in applicable_today.items():
+        # global
+        rg = _laplace(blk_g[fid], app_g[fid])
+
+        # archetype weighted (preferred Top-K with ov=1 & lh=1)
+        arc_pairs = []
+        for k, w in pref_weights.items():
+            a = app_arc[(fid, k)]
+            b = blk_arc[(fid, k)]
+            # reliability downweighting for small 'a'
+            rel = float(a) / (float(a) + 10.0)
+            rk = _laplace(b, a)
+            arc_pairs.append((w * rel, rk))
+        r_arc = _weighted_mix(arc_pairs)
+
+        # cluster-2 weighted
+        c2_pairs = []
+        for lab, w in c2_weights.items():
+            a = app_c2[(fid, lab)]
+            b = blk_c2[(fid, lab)]
+            rel = float(a) / (float(a) + 10.0)
+            rc2 = _laplace(b, a)
+            c2_pairs.append((w * rel, rc2))
+        r_c2 = _weighted_mix(c2_pairs)
+
+        # cluster-3 weighted
+        c3_pairs = []
+        for lab, w in c3_weights.items():
+            a = app_c3[(fid, lab)]
+            b = blk_c3[(fid, lab)]
+            rel = float(a) / (float(a) + 10.0)
+            rc3 = _laplace(b, a)
+            c3_pairs.append((w * rel, rc3))
+        r_c3 = _weighted_mix(c3_pairs)
+
+        # Combine with backoff — renormalize using available parts only
+        parts = []
+        if pd.notna(r_arc): parts.append((0.60, r_arc))
+        if pd.notna(r_c2):  parts.append((0.25, r_c2))
+        if pd.notna(r_c3):  parts.append((0.15, r_c3))
+        # if everything missing (can happen on very tiny histories), fall back to global
+        r_today = _weighted_mix(parts) if parts else rg
+        safe_score = 1.0 - r_today if pd.notna(r_today) else float("nan")
+
+        rows.append({
+            "filter_id": fid,
+            "name": f.name,
+            "risk_global": round(rg, 6),
+            "risk_archetype": (None if pd.isna(r_arc) else round(r_arc, 6)),
+            "risk_cluster2": (None if pd.isna(r_c2) else round(r_c2, 6)),
+            "risk_cluster3": (None if pd.isna(r_c3) else round(r_c3, 6)),
+            "risk_today": (None if pd.isna(r_today) else round(r_today, 6)),
+            "safe_score": (None if pd.isna(safe_score) else round(safe_score, 6)),
+            "support_global": int(app_g[fid]),
+            "elim_count": int(elim_counts.get(fid, 0)),
+        })
+
+    df = pd.DataFrame(rows)
+
+    # Bucketize by aggression on *today's pool*
+    def _bucket(c):
+        c = float(c)
+        if c >= 701: return "701+"
+        if c >= 501: return "501–700"
+        if c >= 301: return "301–500"
+        if c >= 101: return "101–300"
+        if c >=  61: return "61–100"
+        if c >=   1: return "1–60"
+        return "0"
+    if not df.empty:
+        df["group"] = df["elim_count"].map(_bucket)
+
+    # Ordering for readability: most aggressive buckets first, then safest within bucket
+    order_buckets = ["701+","501–700","301–500","101–300","61–100","1–60","0"]
+    bucket_rank = {b:i for i,b in enumerate(order_buckets)}
+    if not df.empty:
+        df["__br"] = df["group"].map(bucket_rank).fillna(len(order_buckets)).astype(int)
+        df = df.sort_values(
+            by=["__br","safe_score","elim_count","filter_id"],
+            ascending=[True, False, False, True]
+        ).drop(columns="__br")
+
+    # Write both files
+    from datetime import datetime
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    arc_path = OUTPUT_DIR / f"archetype_distribution_{ts}.csv"
+    df_path  = OUTPUT_DIR / f"archetype_filter_risk_{ts}.csv"
+    arc_df.to_csv(arc_path, index=False)
+    df.to_csv(df_path, index=False)
+
+    return {"archetype_distribution": str(arc_path), "archetype_filter_risk": str(df_path)}
+
+# =============================================================================
+# NoPool (historical signals without pool) — TODAY'S applicable pairs only
+# =============================================================================
+def nopool_today_pairs(
+    winners: List[str],
+    filters_all: Dict[str, FilterDef],
+    idx_now: int,
+    *, min_days: int = NOPOOL_MIN_DAYS,
+    min_keep: float = NOPOOL_MIN_KEEP,
+    parity_skew: float = NOPOOL_PARITY_SKEW,
+    max_rows: int = NOPOOL_MAX_ROWS,
+) -> pd.DataFrame:
+    N = idx_now
+    if N < 2:
+        return pd.DataFrame()
+    envs = [build_env_for_draw(i, winners) for i in range(1, idx_now+1)]
+    env_now = envs[-1]
+    todays_ids = [fid for fid, f in filters_all.items() if safe_eval(f.applicable_if, env_now)]
+    if len(todays_ids) < 2:
+        return pd.DataFrame()
+
+    f_slice = {fid: filters_all[fid] for fid in todays_ids}
+    comp_app, comp_blk = {}, {}
+    for fid, f in f_slice.items():
+        try:  comp_app[fid] = compile(f.applicable_if if f.applicable_if else "True", "<app_if>", "eval")
+        except Exception: comp_app[fid] = compile("False", "<app_if>", "eval")
+        try:  comp_blk[fid] = compile(f.expression if f.expression else "False", "<expr>", "eval")
+        except Exception: comp_blk[fid] = compile("False", "<expr>", "eval")
+
+    F = len(f_slice)
+    idx_map = {fid:i for i,fid in enumerate(todays_ids)}
+    app = np.zeros((N, F), dtype=bool)
+    blk = np.zeros((N, F), dtype=bool)
+    even_arr = np.zeros(N, dtype=int)
+
+    for i, env in enumerate(envs):
+        even_arr[i] = 1 if (sum(env["combo_digits_list"]) % 2 == 0) else 0
+        for fid in todays_ids:
+            j = idx_map[fid]
+            try:
+                a = bool(eval(comp_app[fid], {"__builtins__": {}}, env))
+            except Exception:
+                a = False
+            app[i, j] = a
+            if a:
+                try:
+                    b = bool(eval(comp_blk[fid], {"__builtins__": {}}, env))
+                except Exception:
+                    b = False
+                blk[i, j] = b
+
+    recs = []
+    for a_idx in range(F):
+        for b_idx in range(a_idx+1, F):
+            mask = app[:, a_idx] & app[:, b_idx]
+            n = int(mask.sum()); 
+            if n == 0: continue
+            either_blocks = int(((blk[:, a_idx] | blk[:, b_idx]) & mask).sum())
+            both_blocks  = int(((blk[:, a_idx] & blk[:, b_idx]) & mask).sum())
+            kept_rate = (1 - (either_blocks / n)) * 100.0
+            even_rate = float(even_arr[mask].mean() * 100.0)
+            parity_note = ""
+            if abs(even_rate - 50.0) >= float(parity_skew):
+                tip = "EVEN" if even_rate >= 50.0 else "ODD"
+                parity_note = f"{tip} skew: {even_rate:.1f}%"
+            recs.append({
+                "Filter A ID": todays_ids[a_idx],
+                "Filter B ID": todays_ids[b_idx],
+                "Days both applicable (history)": n,
+                "Winner kept % (both applicable)": round(kept_rate, 3),
+                "Either blocks winner %": round((either_blocks/n)*100.0, 3),
+                "Both block winner %": round((both_blocks/n)*100.0, 3),
+                "Parity note (only if meaningful)": parity_note,
+            })
+    df = pd.DataFrame(recs)
+    if df.empty:
+        return df
+    df = df.sort_values(
+        ["Winner kept % (both applicable)", "Days both applicable (history)"],
+        ascending=[False, False]
+    )
+    df_all = df.copy()
+    df_viable = df[(df["Days both applicable (history)"] >= int(min_days)) &
+                   (df["Winner kept % (both applicable)"] >= float(min_keep))].copy()
+    df_all.to_csv(OUTPUT_DIR / "NoPool_today_pairs_ALL.csv", index=False)
+    df_viable.head(max_rows).to_csv(OUTPUT_DIR / "NoPool_today_pairs_TOP.csv", index=False)
+    return df_viable.head(max_rows)
+
+# =============================================================================
+# Final SafeList builders (existing)
+# =============================================================================
+def _detect_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+def build_final_ordered_safelist(
+    safe_source_path: str | Path = "do_not_apply.csv",
+    avoid_pairs_path: str | Path = "avoid_pairs.csv",
+    seq_path: str | Path = "recommender_sequence.csv",
+    out_basename: str = "final_safe_ordered",
+) -> Optional[Dict[str, object]]:
+    """
+    SAFE only (from do_not_apply.csv) → drop anything seen in avoid_pairs.csv → 
+    order by recommender_sequence.csv (keep all revised safelist items).
+    """
+    safe_source_path  = Path(safe_source_path)
+    avoid_pairs_path  = Path(avoid_pairs_path)
+    seq_path          = Path(seq_path)
+    if not safe_source_path.exists() or not avoid_pairs_path.exists():
+        return None
+
+    safe_df = pd.read_csv(safe_source_path)
+    tier_col = _detect_col(safe_df, ["tier", "Tier", "TIER"])
+    fid_col  = _detect_col(safe_df, ["filter_id", "Filter ID", "FILTER_ID", "fid", "FID", "id"])
+    if not tier_col or not fid_col:
+        return None
+    safe_df[fid_col] = safe_df[fid_col].astype(str).str.strip()
+    safe_only = safe_df[safe_df[tier_col].astype(str).str.upper() == "SAFE"].copy()
+    safe_ids = set(safe_only[fid_col])
+
+    metrics = (
+        safe_only.rename(columns={fid_col: "filter_id"})
+        .drop_duplicates("filter_id")
+        .set_index("filter_id")
+    )
+
+    ap_df = pd.read_csv(avoid_pairs_path)
+    fid1 = _detect_col(ap_df, ["filter_id_1", "FID1", "fid1"])
+    fid2 = _detect_col(ap_df, ["filter_id_2", "FID2", "fid2"])
+    if not fid1 or not fid2:
+        return None
+    ap_ids = set(ap_df[fid1].astype(str).str.strip()) | set(ap_df[fid2].astype(str).str.strip())
+    revised_safe_ids = [fid for fid in safe_ids if fid not in ap_ids]
+
+    in_seq_order, not_in_seq = [], []
+    elim_map: Dict[str, float] = {}
+
+    if seq_path.exists():
+        seq_df = pd.read_csv(seq_path)
+        seq_fid = _detect_col(seq_df, ["filter_id", "Filter ID", "FILTER_ID", "fid", "FID", "id"])
+        if seq_fid:
+            seq_df[seq_fid] = seq_df[seq_fid].astype(str).str.strip()
+            seq_order = seq_df[seq_fid].tolist()
+            elim_col = _detect_col(seq_df, ["eliminated_now", "eliminations", "elim_count", "elimination_count", "elims"])
+            if elim_col:
+                try:
+                    elim_map = dict(zip(seq_df[seq_fid], pd.to_numeric(seq_df[elim_col], errors="coerce").fillna(0)))
+                except Exception:
+                    elim_map = {}
+            in_seq_order = [fid for fid in seq_order if fid in revised_safe_ids]
+            remaining = [fid for fid in revised_safe_ids if fid not in set(in_seq_order)]
+        else:
+            remaining = list(revised_safe_ids)
+    else:
+        remaining = list(revised_safe_ids)
+
+    def aggression(fid: str) -> float:
+        if fid in elim_map:
+            try: return float(elim_map[fid])
+            except Exception: pass
+        if "support" in metrics.columns and fid in metrics.index:
+            try: return float(metrics.loc[fid, "support"])
+            except Exception: pass
+        if "risk" in metrics.columns and fid in metrics.index:
+            try: return float(metrics.loc[fid, "risk"])
+            except Exception: pass
+        return 0.0
+
+    not_in_seq = sorted(remaining, key=aggression, reverse=True)
+    final_ids = in_seq_order + not_in_seq
+
+    from datetime import datetime
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    base = f"{out_basename}_{ts}"
+    out_csv = OUTPUT_DIR / f"{base}.csv"
+    out_txt = OUTPUT_DIR / f"{base}.txt"
+    out_html = OUTPUT_DIR / f"{base}.html"
+
+    final_df = pd.DataFrame({"filter_id": final_ids})
+    if not metrics.empty:
+        final_df = final_df.merge(metrics.reset_index(), on="filter_id", how="left")
+
+    final_df.to_csv(out_csv, index=False)
+    with open(out_txt, "w", encoding="utf-8") as f:
+        for fid in final_ids:
+            f.write(f"{fid}\n")
+    final_df.to_html(out_html, index=False, escape=False)
+
+    return {
+        "counts": {
+            "safe_only": len(safe_ids),
+            "revised_safe": len(revised_safe_ids),
+            "in_sequence": len(in_seq_order),
+            "not_in_sequence": len(not_in_seq),
+            "final_total": len(final_ids),
+        },
+        "outputs": {"csv": str(out_csv), "txt": str(out_txt), "html": str(out_html)},
+    }
+
+def build_final_safest_first_safelist(
+    safe_source_path: str | Path = "do_not_apply.csv",
+    avoid_pairs_path: str | Path = "avoid_pairs.csv",
+    seq_path: str | Path = "recommender_sequence.csv",  # optional for elim tiebreak
+    out_basename: str = "final_safe_safest_first",
+) -> Optional[Dict[str, object]]:
+    """
+    SAFE only → minus avoid_pairs → ignore sequence; sort by (risk ASC, support DESC, elim DESC if present).
+    """
+    safe_source_path  = Path(safe_source_path)
+    avoid_pairs_path  = Path(avoid_pairs_path)
+    seq_path          = Path(seq_path)
+    if not safe_source_path.exists() or not avoid_pairs_path.exists():
+        return None
+
+    safe_df = pd.read_csv(safe_source_path)
+    tier_col = _detect_col(safe_df, ["tier", "Tier", "TIER"])
+    fid_col  = _detect_col(safe_df, ["filter_id", "Filter ID", "FILTER_ID", "fid", "FID", "id"])
+    if not tier_col or not fid_col:
+        return None
+
+    safe_df[fid_col] = safe_df[fid_col].astype(str).str.strip()
+    safe_only = safe_df[safe_df[tier_col].astype(str).str.upper() == "SAFE"].copy()
+    safe_ids = set(safe_only[fid_col])
+
+    metrics = (
+        safe_only.rename(columns={fid_col: "filter_id"})
+        .drop_duplicates("filter_id")
+        .set_index("filter_id")
+    )
+
+    ap_df = pd.read_csv(avoid_pairs_path)
+    fid1 = _detect_col(ap_df, ["filter_id_1", "FID1", "fid1"])
+    fid2 = _detect_col(ap_df, ["filter_id_2", "FID2", "fid2"])
+    if not fid1 or not fid2:
+        return None
+    ap_ids = set(ap_df[fid1].astype(str).str.strip()) | set(ap_df[fid2].astype(str).str.strip())
+    revised_safe_ids = [fid for fid in safe_ids if fid not in ap_ids]
+
+    elim_map: Dict[str, float] = {}
+    if seq_path.exists():
+        try:
+            seq_df = pd.read_csv(seq_path)
+            seq_fid = _detect_col(seq_df, ["filter_id", "Filter ID", "FILTER_ID", "fid", "FID", "id"])
+            elim_col = _detect_col(seq_df, ["eliminated_now", "eliminations", "elim_count", "elimination_count", "elims"])
+            if seq_fid and elim_col:
+                elim_map = dict(zip(
+                    seq_df[seq_fid].astype(str).str.strip(),
+                    pd.to_numeric(seq_df[elim_col], errors="coerce").fillna(0.0)
+                ))
+        except Exception:
+            elim_map = {}
+
+    def risk_of(fid: str) -> float:
+        try: return float(metrics.loc[fid, "risk"])
+        except Exception: return 1e9
+
+    def support_of(fid: str) -> float:
+        try: return float(metrics.loc[fid, "support"])
+        except Exception: return -1e9
+
+    def elims_of(fid: str) -> float:
+        try: return float(elim_map.get(fid, 0.0))
+        except Exception: return 0.0
+
+    ordered = sorted(
+        revised_safe_ids,
+        key=lambda fid: (risk_of(fid), -support_of(fid), -elims_of(fid))
+    )
+
+    from datetime import datetime
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    base = f"{out_basename}_{ts}"
+    out_csv = OUTPUT_DIR / f"{base}.csv"
+    out_txt = OUTPUT_DIR / f"{base}.txt"
+    out_html = OUTPUT_DIR / f"{base}.html"
+
+    final_df = pd.DataFrame({"filter_id": ordered})
+    if not metrics.empty:
+        final_df = final_df.merge(metrics.reset_index(), on="filter_id", how="left")
+
+    final_df.to_csv(out_csv, index=False)
+    with open(out_txt, "w", encoding="utf-8") as f:
+        for fid in ordered:
+            f.write(f"{fid}\n")
+    final_df.to_html(out_html, index=False, escape=False)
+
+    return {
+        "counts": {"safe_only": len(safe_ids), "revised_safe": len(revised_safe_ids), "final_total": len(ordered)},
+        "outputs": {"csv": str(out_csv), "txt": str(out_txt), "html": str(out_html)},
+    }
+
+def build_final_grouped_by_aggression_on_pool(
+    filters_map: Dict[str, FilterDef],
+    base_env: Dict[str, object],
+    base_pool: List[str],
+    safe_source_path: str | Path = "do_not_apply.csv",
+    avoid_pairs_path: str | Path = "avoid_pairs.csv",
+    out_basename: str = "final_safe_grouped",
+) -> Optional[Dict[str, object]]:
+    """
+    SAFE only → minus avoid_pairs → for each filter compute elim_count on the *baseline pool* (applied solo),
+    bucket by elim_count (701+, 501–700, 301–500, 101–300, 61–100, 1–60, 0), and within each bucket
+    sort by (risk ASC, support DESC, elim_count DESC). Write CSV/TXT/HTML.
+    """
+    safe_source_path  = Path(safe_source_path)
+    avoid_pairs_path  = Path(avoid_pairs_path)
+    if not safe_source_path.exists() or not avoid_pairs_path.exists():
+        return None
+
+    safe_df = pd.read_csv(safe_source_path)
+    tier_col = _detect_col(safe_df, ["tier", "Tier", "TIER"])
+    fid_col  = _detect_col(safe_df, ["filter_id", "Filter ID", "FILTER_ID", "fid", "FID", "id"])
+    if not tier_col or not fid_col:
+        return None
+
+    safe_df[fid_col] = safe_df[fid_col].astype(str).str.strip()
+    safe_only = safe_df[safe_df[tier_col].astype(str).str.upper() == "SAFE"].copy()
+    safe_ids = set(safe_only[fid_col])
+
+    metrics = (
+        safe_only.rename(columns={fid_col: "filter_id"})
+        .drop_duplicates("filter_id")
+        .set_index("filter_id")
+    )
+
+    ap_df = pd.read_csv(avoid_pairs_path)
+    fid1 = _detect_col(ap_df, ["filter_id_1", "FID1", "fid1"])
+    fid2 = _detect_col(ap_df, ["filter_id_2", "FID2", "fid2"])
+    if not fid1 or not fid2:
+        return None
+    ap_ids = set(ap_df[fid1].astype(str).str.strip()) | set(ap_df[fid2].astype(str).str.strip())
+    revised_safe_ids = [fid for fid in safe_ids if fid not in ap_ids]
+
+    # Solo elimination on the baseline pool (today's pool), NO winner guard.
+    records = []
+    for fid in revised_safe_ids:
+        f = filters_map.get(fid)
+        if not f:
+            continue
+        _, elim = apply_filter_to_pool(f, base_env, base_pool)
+        rec = {"filter_id": fid, "elim_count": int(elim)}
+        if not metrics.empty and fid in metrics.index:
+            for col in ("risk","support","name"):
+                if col in metrics.columns:
+                    rec[col] = metrics.loc[fid, col]
+        records.append(rec)
+
+    if not records:
+        return None
+
+    df = pd.DataFrame(records)
+    # Bucketization
+    def _bucket(c):
+        c = float(c)
+        if c >= 701: return "701+"
+        if c >= 501: return "501–700"
+        if c >= 301: return "301–500"
+        if c >= 101: return "101–300"
+        if c >=  61: return "61–100"
+        if c >=   1: return "1–60"
+        return "0"
+    df["group"] = df["elim_count"].map(_bucket)
+
+    # Ordering
+    order_buckets = ["701+","501–700","301–500","101–300","61–100","1–60","0"]
+    bucket_rank = {b:i for i,b in enumerate(order_buckets)}
+    df["__bucket_rank"] = df["group"].map(bucket_rank).fillna(len(order_buckets)).astype(int)
+
+    def _risk(x): 
+        try: return float(x)
+        except Exception: return 1e9
+    def _support(x):
+        try: return float(x)
+        except Exception: return -1e9
+
+    df = df.sort_values(
+        by=["__bucket_rank","risk","support","elim_count","filter_id"],
+        ascending=[True, True, False, False, True]
+    ).drop(columns="__bucket_rank")
+
+    # Write files
+    from datetime import datetime
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    base = f"{out_basename}_{ts}"
+    out_csv = OUTPUT_DIR / f"{base}.csv"
+    out_txt = OUTPUT_DIR / f"{base}.txt"
+    out_html = OUTPUT_DIR / f"{base}.html"
+
+    df.to_csv(out_csv, index=False)
+    with open(out_txt, "w", encoding="utf-8") as f:
+        for _, r in df.iterrows():
+            f.write(f"{r['filter_id']}\n")
+    df.to_html(out_html, index=False, escape=False)
+
+    counts_by_group = df["group"].value_counts().to_dict()
+    return {"outputs": {"csv": str(out_csv), "txt": str(out_txt), "html": str(out_html)},
+            "counts_by_group": counts_by_group}
+
+# =============================================================================
+# Public entry
+# =============================================================================
+def main(
+    winners_csv: Optional[str] = None,
+    filters_csv: Optional[str] = None,
+    today_pool_csv: Optional[str] = None,
+    target_max: int = TARGET_MAX,
+    always_keep_winner: bool = ALWAYS_KEEP_WINNER,
+    minimize_beyond_target: bool = MINIMIZE_BEYOND_TARGET,
+    force_keep_combo: Optional[str] = None,
+    override_seed: Optional[str] = None,
+    override_prev: Optional[str] = None,
+    override_prevprev: Optional[str] = None,
+    max_draws: Optional[int] = None,
+    max_bucket_matches: Optional[int] = None,
+    decay_half_life: Optional[int] = None,
+    applicable_only: Optional[List[str]] = None,
+    affinity_exclude_top_pct: Optional[float] = None,
+    include_nopool_panel: bool = INCLUDE_NOPOOL_PANEL,
+):
+
+    winners_path = winners_csv or WINNERS_CSV
+    filters_path = filters_csv or FILTERS_CSV
+
+    present = ", ".join(sorted(p.name for p in Path(".").glob("*.csv")))
+    if not Path(winners_path).exists():
+        raise FileNotFoundError(f"Missing {winners_path}. CSVs here: {present}")
+    if not Path(filters_path).exists():
+        raise FileNotFoundError(f"Missing {filters_path}. CSVs here: {present}")
+
+    winners_df = pd.read_csv(winners_path)
+    winners = load_winners(winners_path)
+    filters_list = load_filters(filters_path)
+
+    # Build map id->filter
+    filters_map: Dict[str, FilterDef] = {f.fid: f for f in filters_list if f.enabled}
+
+    idx_now, applicable, env_now = today_applicable_filters(filters_list, winners)
+
+    # If caller wants to limit to a subset of filters
+    if applicable_only:
+        applicable_only = {fid.strip() for fid in applicable_only}
+        applicable = {fid: f for fid, f in applicable.items() if fid in applicable_only}
+
+    # Historical risk for ranking order
+    single_fail, pair_risk, idx_used = historical_risk_for_applicable(
+        list(applicable.values()), winners, idx_now,
+        max_draws=max_draws, max_bucket_matches=max_bucket_matches,
+        decay_half_life=decay_half_life
+    )
+    support = {fid: 0 for fid in applicable}
+    for i in idx_used:
+        env_i = build_env_for_draw(i, winners)
+        for fid, f in applicable.items():
+            if safe_eval(f.applicable_if, env_i):
+                support[fid] = support.get(fid, 0) + 1
+    ranked = sorted(applicable.values(),
+                    key=lambda f: (single_fail.get(f.fid, 1.0), -support.get(f.fid,0), f.fid))
+
+    # Load pool (today) or archived
+    if today_pool_csv:
+        df_pool = pd.read_csv(today_pool_csv)
+        if "combo" not in df_pool.columns:
+            if "Result" in df_pool.columns: df_pool = df_pool.rename(columns={"Result":"combo"})
+            else: raise ValueError("Pool CSV must have 'combo' or 'Result' column.")
+        pool = (
+            df_pool["combo"].astype(str).str.replace(r"\D","",regex=True).str.zfill(5)
+        )
+        pool = pool[pool.str.fullmatch(r"\d{5}")].tolist()
+    else:
+        seed_row = winners_df.iloc[idx_now-1]
+        pool_df = get_pool_for_seed(seed_row)
+        pool = pool_df["combo"].astype(str).tolist()
+
+    remaining = len(pool)
+    seq_rows = []  # step log
+
+    # ===== Anti-affinity pre-trim (drop top X% most seed-like) =====
+    if pool and affinity_exclude_top_pct and 0 < float(affinity_exclude_top_pct) < 1:
+        aff = np.array([combo_affinity(env_now, c) for c in pool], dtype=float)
+        ranks = pd.Series(aff).rank(method="average", ascending=True)
+        thr = 1.0 - float(affinity_exclude_top_pct)          # drop top X%  ≡ aff_pct >= thr
+        aff_pct = (ranks - 1) / max(len(pool) - 1, 1)
+
+        keep_mask = aff_pct < thr
+        new_pool = [c for c, keep in zip(pool, keep_mask) if keep]
+        elim = len(pool) - len(new_pool)
+        pool = new_pool
+        remaining = len(pool)
+        seq_rows.append({
+            "step": 0,
+            "filter_id": f"AFF_TOP{int(round(affinity_exclude_top_pct*100))}",
+            "name": f"Anti-affinity: drop top {int(round(affinity_exclude_top_pct*100))}%",
+            "eliminated_now": elim,
+            "remaining": remaining,
+            "skipped_reason": None,
+        })
+
+    # ===== Pair conflicts (for "avoid pairs" table) =====
+    avoid_rows = []
+    for a, b in it.combinations(sorted(applicable.keys()), 2):
+        pr = pair_risk.get((a,b)) or pair_risk.get((b,a)) or 0.0
+        if pr > 0:
+            co_app = both_blk = 0
+            for i in idx_used:
+                env_i = build_env_for_draw(i, winners)
+                ai = safe_eval(applicable[a].applicable_if, env_i)
+                bi = safe_eval(applicable[b].applicable_if, env_i)
+                if ai and bi:
+                    co_app += 1
+                    if safe_eval(applicable[a].expression, env_i) and safe_eval(applicable[b].expression, env_i):
+                        both_blk += 1
+            if co_app > 0:
+                avoid_rows.append({
+                    "filter_id_1": a, "filter_id_2": b,
+                    "co_applicable_n": co_app, "both_blocked_n": both_blk,
+                    "pair_risk": round(both_blk / max(co_app, 1), 6)
+                })
+    pd.DataFrame(avoid_rows).sort_values(
+        ["pair_risk","co_applicable_n"], ascending=[False,False]
+    ).to_csv(OUTPUT_DIR / "avoid_pairs.csv", index=False)
+
+    # ===== Apply filters in order (no winner guard in prediction mode) =====
+    base_env = env_now
+    final_pool = pool[:] if pool else None
+
+    for step, f in enumerate(ranked, start=1):
+        fid = f.fid
+        if final_pool is not None:
+            new_pool, elim = apply_filter_to_pool(f, base_env, final_pool)
+            if elim == 0:
+                seq_rows.append({
+                    "step": step, "filter_id": fid, "name": f.name,
+                    "eliminated_now": 0, "remaining": remaining,
+                    "skipped_reason": "no_reduction"
+                })
+                continue
+            final_pool = new_pool
+            remaining = len(final_pool)
+            seq_rows.append({
+                "step": step, "filter_id": fid, "name": f.name,
+                "eliminated_now": elim, "remaining": remaining,
+                "skipped_reason": None
+            })
+            if (remaining <= target_max) and (not minimize_beyond_target):
+                break
+        else:
+            seq_rows.append({
+                "step": step, "filter_id": fid, "name": f.name,
+                "eliminated_now": None, "remaining": None,
+                "skipped_reason": None
+            })
+
+    # ===== Outputs (sequence) =====
+    seq_df = pd.DataFrame(seq_rows)
+    seq_df.to_csv(OUTPUT_DIR / "recommender_sequence.csv", index=False)
+    if final_pool is not None:
+        pd.DataFrame([r for r in seq_rows if r["eliminated_now"] not in (None,0)]).to_csv(
+            OUTPUT_DIR / "pool_reduction_log.csv", index=False
+        )
+
+    # ===== Tier list (quick “do not apply” summary) =====
+    rows = []
+    for fid, f in applicable.items():
+        risk = float((single_fail.get(fid, 0.0)))
+        sup  = int(support.get(fid, 0))
+        if risk >= 0.20 and sup >= 6: tier = "DO_NOT_APPLY"
+        elif risk >= 0.10:            tier = "APPLY_LATE"
+        else:                          tier = "SAFE"
+        rows.append({"filter_id": fid, "name": f.name, "risk": round(risk,4), "support": sup, "tier": tier})
+    tier_order = {"DO_NOT_APPLY": 0, "APPLY_LATE": 1, "SAFE": 2}
+    do_not_df = pd.DataFrame(rows)
+    if not do_not_df.empty:
+        do_not_df = do_not_df.sort_values(
+            by=["tier","risk","support","filter_id"],
+            ascending=[True, False, False, True],
+            key=lambda s: s.map(tier_order) if s.name == "tier" else s
+        )
+        do_not_df.to_csv(OUTPUT_DIR / "do_not_apply.csv", index=False)
+
+    # ===== NoPool panel (today’s historically safe pairs) =====
+    if include_nopool_panel:
+        _ = nopool_today_pairs(
+            winners, filters_map, idx_now,
+            min_days=NOPOOL_MIN_DAYS,
+            min_keep=NOPOOL_MIN_KEEP,
+            parity_skew=NOPOOL_PARITY_SKEW,
+            max_rows=NOPOOL_MAX_ROWS,
+        )
+
+    # ===== Archetype-conditioned safety (writes two CSVs)
+    _ = compute_archetype_tables_and_filter_risk(
+        winners=winners,
+        filters_all=list(filters_map.values()),
+        idx_now=idx_now,
+        applicable_today=applicable,
+        base_env=base_env,
+        base_pool=(pool[:] if pool else []),
+        topk=10,
+    )
+
+    # ===== Final SafeLists (existing)
+    _ = build_final_ordered_safelist(
+        safe_source_path=OUTPUT_DIR / "do_not_apply.csv",
+        avoid_pairs_path=OUTPUT_DIR / "avoid_pairs.csv",
+        seq_path=OUTPUT_DIR / "recommender_sequence.csv",
+        out_basename="final_safe_ordered",
+    )
+    _ = build_final_safest_first_safelist(
+        safe_source_path=OUTPUT_DIR / "do_not_apply.csv",
+        avoid_pairs_path=OUTPUT_DIR / "avoid_pairs.csv",
+        seq_path=OUTPUT_DIR / "recommender_sequence.csv",
+        out_basename="final_safe_safest_first",
+    )
+    _ = build_final_grouped_by_aggression_on_pool(
+        filters_map=filters_map,
+        base_env=base_env,
+        base_pool=(pool[:] if pool else []),
+        safe_source_path=OUTPUT_DIR / "do_not_apply.csv",
+        avoid_pairs_path=OUTPUT_DIR / "avoid_pairs.csv",
+        out_basename="final_safe_grouped",
+    )
+
+    # ===== One-pager (HTML)
+    seed_list = base_env['seed_digits_list']
+    parity_major = "even>=3" if sum(1 for d in seed_list if d%2==0) >= 3 else "even<=2"
+
+    HTML_CSS = """<!doctype html><html lang='en'><head><meta charset='utf-8'>
+<title>DC5 Recommender — One-Pager</title>
+<style>
+:root { --fg:#0f172a; --muted:#64748b; --bg:#fff; }
+body { margin:0; font:14px/1.5 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Inter, Helvetica, Arial; color:var(--fg); background:var(--bg); }
+.wrap { max-width: 900px; margin: 28px auto 64px; padding: 0 20px; }
+h1 { font-size: 24px; margin: 0 0 8px; }
+h2 { font-size: 18px; margin: 24px 0 8px; }
+.card { border:1px solid #e2e8f0; border-radius:16px; padding:16px; box-shadow:0 1px 2px rgba(15,23,42,.04); }
+.table { width:100%; border-collapse: collapse; }
+.table th, .table td { text-align:left; padding:8px 10px; border-bottom:1px solid #e5e7eb; }
+.table th { background:#f8fafc; font-weight:700; }
+.kpi { background:#f8fafc; padding:8px 10px; border-radius:12px; border:1px solid #e2e8f0; display:inline-block; margin-right:8px; }
+.badge { display:inline-block; padding:6px 10px; border-radius:12px; background:#eef2ff; margin-right:8px; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+</style></head><body><div class='wrap'>"""
+
+    applied = seq_df[seq_df["eliminated_now"].notna() & (seq_df["eliminated_now"]>0)]
+    skipped = seq_df[seq_df["skipped_reason"].notna() & (seq_df["skipped_reason"]!="")]
+
+    snap = (
+        "<h1>DC5 Recommender — One-Pager</h1>"
+        "<div class='card'><div><b>Seed:</b> {} &nbsp;·&nbsp; <b>Sum:</b> {} ({}) "
+        "&nbsp;·&nbsp; <b>Structure:</b> {} &nbsp;·&nbsp; <b>Spread:</b> {} "
+        "&nbsp;·&nbsp; <b>Parity:</b> {}</div>"
+        "<div style='margin-top:8px'><span class='kpi'>Anti-affinity default: drop top {}%</span></div>"
+        "</div>"
+    ).format(
+        html.escape(str(base_env['seed'])),
+        base_env['seed_sum'], html.escape(base_env['seed_sum_category']),
+        html.escape(classify_structure(seed_list)),
+        base_env['spread_seed'], parity_major,
+        int(round((AFFINITY_EXCLUDE_TOP_PCT)*100)),
+    )
+
+    def df_to_html_table(df: pd.DataFrame, columns: list, empty_msg: str, limit: int = None):
+        if df is None or df.empty:
+            return "<p class='muted mono'>{}</p>".format(html.escape(empty_msg))
+        use = df[columns].copy() if columns else df.copy()
+        if limit: use = use.head(limit)
+        return use.to_html(index=False, classes="table", border=0, escape=True)
+
+    avoid_path = OUTPUT_DIR / "avoid_pairs.csv"
+    avoid_df = pd.read_csv(avoid_path) if avoid_path.exists() else pd.DataFrame()
+    avoid_sorted = avoid_df.sort_values(["pair_risk","co_applicable_n"], ascending=[False,False]) if not avoid_df.empty else avoid_df
+
+    applied_html = df_to_html_table(applied, ["step","filter_id","name","eliminated_now","remaining"],
+                                    "No reduction steps.", 60)
+    skipped_html = df_to_html_table(skipped, ["filter_id","name","skipped_reason"],
+                                    "No steps were skipped.", 60)
+    avoid_html   = df_to_html_table(avoid_sorted,
+                                    ["filter_id_1","filter_id_2","pair_risk","both_blocked_n","co_applicable_n"],
+                                    "No high-risk pairs in this bucket.", 20)
+
+    html_doc = HTML_CSS + snap + \
+        "<div class='card'><h2>Apply in this order (sequence)</h2>{}</div>".format(applied_html) + \
+        "<div class='card'><h2>Skipped steps</h2>{}</div>".format(skipped_html) + \
+        "<div class='card'><h2>Avoid combining (today’s bucket)</h2>{}</div>".format(avoid_html) + \
+        "</div></body></html>"
+
+    (OUTPUT_DIR / "one_pager.html").write_text(html_doc, encoding="utf-8")
+    return seq_rows
+
+__all__ = [
+    "WINNERS_CSV","FILTERS_CSV","TODAY_POOL_CSV","OUTPUT_DIR",
+    "TARGET_MAX","ALWAYS_KEEP_WINNER","MINIMIZE_BEYOND_TARGET",
+    "AFFINITY_EXCLUDE_TOP_PCT",
+    "main","combo_affinity","get_pool_for_seed","nopool_today_pairs",
+    "build_final_ordered_safelist","build_final_safest_first_safelist",
+    "build_final_grouped_by_aggression_on_pool",
+    "compute_archetype_tables_and_filter_risk"
+]
+
+if __name__ == "__main__":
+    main()
