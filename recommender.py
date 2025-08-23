@@ -1,4 +1,4 @@
-# recommender.py — winner-preserving filter recommendations with anti-affinity pre-trim
+# recommender.py — filter recommendations with anti-affinity pre-trim (NO winner guard)
 from __future__ import annotations
 
 import math, html, itertools as it
@@ -18,7 +18,8 @@ FILTERS_CSV = "lottery_filters_batch_10.csv"
 TODAY_POOL_CSV: Optional[str] = None
 
 TARGET_MAX = 44
-ALWAYS_KEEP_WINNER = True
+# Winner guard is intentionally OFF for backtesting/prediction
+ALWAYS_KEEP_WINNER = False
 MINIMIZE_BEYOND_TARGET = True
 OUTPUT_DIR = Path(".")
 
@@ -89,73 +90,39 @@ def sum_category(total: int) -> str:
     if 25 <= total <= 33: return "Mid"
     return "High"
 
-def spread_band(spread: int) -> str:
-    if spread <= 3: return "0-3"
-    if spread <= 5: return "4-5"
-    if spread <= 7: return "6-7"
-    if spread <= 9: return "8-9"
-    return "10+"
+def classify_structure(digs: List[int]) -> str:
+    c = Counter(digs); counts = sorted(c.values(), reverse=True)
+    if counts == [5]:       return "quint"
+    if counts == [4,1]:     return "quad"
+    if counts == [3,2]:     return "triple_double"
+    if counts == [3,1,1]:   return "triple"
+    if counts == [2,2,1]:   return "double_double"
+    if counts == [2,1,1,1]: return "double"
+    return "single"
 
-def hot_cold_due(history: List[List[int]], k_hotcold: int = 10):
-    flat = [d for row in history[-k_hotcold:] for d in row]
-    cnt = Counter(flat)
-    hot, cold = set(), set()
-    if cnt:
-        most = cnt.most_common()
-        topk = 6
-        thresh = most[topk-1][1] if len(most) >= topk else most[-1][1]
-        hot = {d for d,c in most if c >= thresh}
-        least = sorted(cnt.items(), key=lambda x: (x[1], x[0]))
-        coldk = 4
-        if least:
-            cth = least[coldk-1][1] if len(least) >= coldk else least[0][1]
-            cold = {d for d,c in least if c <= cth}
-    last2 = set(d for row in history[-2:] for d in row)
-    due = set(range(10)) - last2
-    return hot, cold, due
+def _parity_major_label(digs: List[int]) -> str:
+    return "even>=3" if sum(1 for d in digs if d % 2 == 0) >= 3 else "even<=2"
 
-def build_env_for_draw(idx: int, winners: List[str]) -> Dict[str, object]:
-    seed   = winners[idx-1]
-    winner = winners[idx]
-    seed_list  = digits_of(seed)
-    combo_list = sorted(digits_of(winner))
-
-    seed_sum = sum(seed_list)
-    combo_sum = sum(combo_list)
-    history_digits = [digits_of(s) for s in winners[:idx]]
-    hot, cold, due = hot_cold_due(history_digits, k_hotcold=10)
-
-    env = {
-        "combo": winner,
-        "combo_digits": set(combo_list),
-        "combo_digits_list": combo_list,
-        "combo_sum": combo_sum,
-        "combo_sum_cat": sum_category(combo_sum),
-        "combo_sum_category": sum_category(combo_sum),
-
-        "seed": seed,
-        "seed_digits": set(seed_list),
-        "seed_digits_list": seed_list,
-        "seed_sum": seed_sum,
-        "seed_sum_category": sum_category(seed_sum),
-
-        "spread_seed": max(seed_list) - min(seed_list),
-        "spread_combo": max(combo_list) - min(combo_list),
-
-        "seed_vtracs": set(VTRAC[d] for d in seed_list),
-        "combo_vtracs": set(VTRAC[d] for d in combo_list),
-
-        "hot_digits": sorted(hot),
-        "cold_digits": sorted(cold),
-        "due_digits": sorted(due),
-
-        "mirror": MIRROR,
-        "vtrac": VTRAC,
-
-        "any": any, "all": all, "len": len, "sum": sum,
-        "max": max, "min": min, "set": set, "sorted": sorted, "Counter": Counter,
-    }
-    return env
+def combo_affinity(env_now: Dict[str, object], combo: str) -> float:
+    cd = digits_of(combo)
+    seedd = env_now["seed_digits_list"]
+    combo_sum, seed_sum = sum(cd), env_now["seed_sum"]
+    sum_prox = math.exp(-abs(combo_sum - seed_sum) / 2.0)
+    spread_c = max(cd) - min(cd)
+    spread_s = env_now["spread_seed"]
+    spread_prox = math.exp(-abs(spread_c - spread_s) / 2.0)
+    struct_match = 1.0 if classify_structure(cd) == classify_structure(seedd) else 0.0
+    parity_match = 1.0 if _parity_major_label(cd) == _parity_major_label(seedd) else 0.0
+    hi8_seed = sum(1 for d in seedd if d >= 8)
+    hi8_combo = sum(1 for d in cd if d >= 8)
+    hi8_score = math.exp(-abs(hi8_combo - hi8_seed) / 1.5)
+    overlap = len(set(seedd) & set(cd))
+    overlap_eq1 = 1.0 if overlap == 1 else 0.0
+    W_SUM, W_SPD, W_STR, W_PAR, W_HI8, W_OV1 = 0.8, 0.3, 0.4, 0.15, 0.35, 0.25
+    return (
+        W_SUM * sum_prox + W_SPD * spread_prox + W_STR * struct_match +
+        W_PAR * parity_match + W_HI8 * hi8_score + W_OV1 * overlap_eq1
+    )
 
 # =============================================================================
 # CSV loaders
@@ -213,46 +180,6 @@ def load_filters(path: str) -> List[FilterDef]:
     return out
 
 # =============================================================================
-# Affinity (used ONLY to rank by similarity for pre-trim)
-# =============================================================================
-def _parity_major_label(digs: List[int]) -> str:
-    return "even>=3" if sum(1 for d in digs if d % 2 == 0) >= 3 else "even<=2"
-
-def classify_structure(digs: List[int]) -> str:
-    c = Counter(digs); counts = sorted(c.values(), reverse=True)
-    if counts == [5]:       return "quint"
-    if counts == [4,1]:     return "quad"
-    if counts == [3,2]:     return "triple_double"
-    if counts == [3,1,1]:   return "triple"
-    if counts == [2,2,1]:   return "double_double"
-    if counts == [2,1,1,1]: return "double"
-    return "single"
-
-def combo_affinity(env_now: Dict[str, object], combo: str) -> float:
-    cd = digits_of(combo)
-    seedd = env_now["seed_digits_list"]
-    combo_sum, seed_sum = sum(cd), env_now["seed_sum"]
-    sum_prox = math.exp(-abs(combo_sum - seed_sum) / 2.0)
-    spread_c = max(cd) - min(cd)
-    spread_s = env_now["spread_seed"]
-    spread_prox = math.exp(-abs(spread_c - spread_s) / 2.0)
-    struct_match = 1.0 if classify_structure(cd) == classify_structure(seedd) else 0.0
-    parity_match = 1.0 if _parity_major_label(cd) == _parity_major_label(seedd) else 0.0
-    hi8_seed = sum(1 for d in seedd if d >= 8)
-    hi8_combo = sum(1 for d in cd if d >= 8)
-    if hi8_seed >= 3:
-        hi8_score = math.exp(-max(0, hi8_combo - 1))
-    else:
-        hi8_score = math.exp(-abs(hi8_combo - hi8_seed) / 1.5)
-    overlap = len(set(seedd) & set(cd))
-    overlap_eq1 = 1.0 if overlap == 1 else 0.0
-    W_SUM, W_SPD, W_STR, W_PAR, W_HI8, W_OV1 = 0.8, 0.3, 0.4, 0.15, 0.35, 0.25
-    return (
-        W_SUM * sum_prox + W_SPD * spread_prox + W_STR * struct_match +
-        W_PAR * parity_match + W_HI8 * hi8_score + W_OV1 * overlap_eq1
-    )
-
-# =============================================================================
 # Risk (history-only) + helpers
 # =============================================================================
 def safe_eval(expr: str, env: Dict[str, object]) -> bool:
@@ -271,7 +198,6 @@ def historical_risk_for_applicable(
     max_bucket_matches: Optional[int] = None,
     decay_half_life: Optional[int] = None,
 ):
-    env_now = build_env_for_draw(idx_now, winners)
     start_idx = max(1, (idx_now - (max_draws or (idx_now - 1))))
     candidate_indices = list(range(start_idx, idx_now))
 
@@ -311,6 +237,46 @@ def historical_risk_for_applicable(
         bb = both_block.get((a,b), 0)
         pair_risk[(a,b)] = bb / n if n > 0 else 0.0
     return single_failure_rate, pair_risk, candidate_indices
+
+def build_env_for_draw(idx: int, winners: List[str]) -> Dict[str, object]:
+    seed   = winners[idx-1]
+    winner = winners[idx]
+    seed_list  = digits_of(seed)
+    combo_list = sorted(digits_of(winner))
+    seed_sum = sum(seed_list)
+    combo_sum = sum(combo_list)
+    history_digits = [digits_of(s) for s in winners[:idx]]
+    hot, cold, due = hot_cold_due(history_digits, k_hotcold=10)
+    return {
+        "combo": winner,
+        "combo_digits": set(combo_list),
+        "combo_digits_list": combo_list,
+        "combo_sum": combo_sum,
+        "combo_sum_cat": sum_category(combo_sum),
+        "combo_sum_category": sum_category(combo_sum),
+
+        "seed": seed,
+        "seed_digits": set(seed_list),
+        "seed_digits_list": seed_list,
+        "seed_sum": seed_sum,
+        "seed_sum_category": sum_category(seed_sum),
+
+        "spread_seed": max(seed_list) - min(seed_list),
+        "spread_combo": max(combo_list) - min(combo_list),
+
+        "seed_vtracs": set(VTRAC[d] for d in seed_list),
+        "combo_vtracs": set(VTRAC[d] for d in combo_list),
+
+        "hot_digits": sorted(hot),
+        "cold_digits": sorted(cold),
+        "due_digits": sorted(due),
+
+        "mirror": MIRROR,
+        "vtrac": VTRAC,
+
+        "any": any, "all": all, "len": len, "sum": sum,
+        "max": max, "min": min, "set": set, "sorted": sorted, "Counter": Counter,
+    }
 
 def today_applicable_filters(filters: List[FilterDef], winners: List[str]):
     if len(winners) < 2:
@@ -645,7 +611,6 @@ def build_final_grouped_safelist(
     seq_path: str | Path = "recommender_sequence.csv",
     out_basename: str = "final_safe_grouped",
 ) -> Optional[Dict[str, object]]:
-    # 1) inputs
     safe_source_path  = Path(safe_source_path)
     avoid_pairs_path  = Path(avoid_pairs_path)
     seq_path          = Path(seq_path)
@@ -665,7 +630,6 @@ def build_final_grouped_safelist(
                .set_index("filter_id"))
     safe_ids = set(metrics.index)
 
-    # 2) remove avoid-pair ids
     ap_df = pd.read_csv(avoid_pairs_path)
     fid1 = _detect_col(ap_df, ["filter_id_1", "FID1", "fid1"])
     fid2 = _detect_col(ap_df, ["filter_id_2", "FID2", "fid2"])
@@ -674,7 +638,6 @@ def build_final_grouped_safelist(
     ap_ids = set(ap_df[fid1].astype(str).str.strip()) | set(ap_df[fid2].astype(str).str.strip())
     revised_ids = [fid for fid in safe_ids if fid not in ap_ids]
 
-    # 3) eliminations map from sequence
     elim_map: Dict[str, float] = {}
     if seq_path.exists():
         try:
@@ -701,7 +664,6 @@ def build_final_grouped_safelist(
     def elims_of(fid: str) -> float:
         return float(elim_map.get(fid, 0.0))
 
-    # 4) bin edges and labels
     def bin_label(e: float) -> str:
         e = float(e)
         if e <= 0: return "0 (no impact)"
@@ -712,7 +674,6 @@ def build_final_grouped_safelist(
         if 501 <= e <= 700:return "501–700 eliminations"
         return "701+ eliminations"
 
-    # 5) score and group
     rows = []
     for fid in revised_ids:
         rows.append({
@@ -743,10 +704,8 @@ def build_final_grouped_safelist(
     df["group"] = pd.Categorical(df["group"], categories=group_order, ordered=True)
     df = df.sort_values(["group","risk","support","elims"], ascending=[True, True, False, False])
 
-    # join back extra metrics cols if present
     out_df = df.merge(metrics.reset_index(), on="filter_id", how="left")
 
-    # outputs
     from datetime import datetime
     ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     base = f"{out_basename}_{ts}"
@@ -762,7 +721,6 @@ def build_final_grouped_safelist(
                 current = r["group"]
                 f.write(f"\n### {current}\n")
             f.write(f"{r['filter_id']}\n")
-    # HTML with group headers
     parts = []
     for grp, gdf in out_df.groupby("group", sort=False):
         hdr = f"<h3 style='margin:8px 0'>{html.escape(str(grp))}</h3>"
@@ -780,7 +738,7 @@ def main(
     filters_csv: Optional[str] = None,
     today_pool_csv: Optional[str] = None,
     target_max: int = TARGET_MAX,
-    always_keep_winner: bool = ALWAYS_KEEP_WINNER,
+    always_keep_winner: bool = ALWAYS_KEEP_WINNER,  # ignored by design
     minimize_beyond_target: bool = MINIMIZE_BEYOND_TARGET,
     force_keep_combo: Optional[str] = None,
     override_seed: Optional[str] = None,
@@ -806,17 +764,14 @@ def main(
     winners = load_winners(winners_path)
     filters_list = load_filters(filters_path)
 
-    # Build map id->filter
     filters_map: Dict[str, FilterDef] = {f.fid: f for f in filters_list if f.enabled}
 
     idx_now, applicable, env_now = today_applicable_filters(filters_list, winners)
 
-    # If caller wants to limit to a subset of filters
     if applicable_only:
         applicable_only = {fid.strip() for fid in applicable_only}
         applicable = {fid: f for fid, f in applicable.items() if fid in applicable_only}
 
-    # Historical risk for ranking order
     single_fail, pair_risk, idx_used = historical_risk_for_applicable(
         list(applicable.values()), winners, idx_now,
         max_draws=max_draws, max_bucket_matches=max_bucket_matches,
@@ -831,7 +786,6 @@ def main(
     ranked = sorted(applicable.values(),
                     key=lambda f: (single_fail.get(f.fid, 1.0), -support.get(f.fid,0), f.fid))
 
-    # Load pool (today) or archived
     if today_pool_csv:
         df_pool = pd.read_csv(today_pool_csv)
         if "combo" not in df_pool.columns:
@@ -845,45 +799,29 @@ def main(
         pool = pool_df["combo"].astype(str).tolist()
 
     remaining = len(pool)
-    winner_today = winners[idx_now] if pool else None
+    winner_today = winners[idx_now] if pool else None  # used only for reporting
 
     seq_rows = []
 
-    # ===== Anti-affinity pre-trim =====
+    # ===== Anti-affinity pre-trim (NO winner guard) =====
     if pool and affinity_exclude_top_pct and 0 < float(affinity_exclude_top_pct) < 1:
         aff = np.array([combo_affinity(env_now, c) for c in pool], dtype=float)
         ranks = pd.Series(aff).rank(method="average", ascending=True)
         thr = 1.0 - float(affinity_exclude_top_pct)
         aff_pct = (ranks - 1) / max(len(pool) - 1, 1)
-        try:
-            win_ix = pool.index(winner_today)
-            win_pct = float(aff_pct.iloc[win_ix])
-        except Exception:
-            win_pct = float("nan")
-        would_remove = (not np.isnan(win_pct)) and (win_pct >= thr)
-        if always_keep_winner and would_remove:
-            seq_rows.append({
-                "step": 0,
-                "filter_id": f"AFF_TOP{int(round(affinity_exclude_top_pct*100))}",
-                "name": f"Anti-affinity: drop top {int(round(affinity_exclude_top_pct*100))}%",
-                "eliminated_now": 0,
-                "remaining": remaining,
-                "skipped_reason": "would_remove_winner",
-            })
-        else:
-            keep_mask = aff_pct < thr
-            new_pool = [c for c, keep in zip(pool, keep_mask) if keep]
-            elim = len(pool) - len(new_pool)
-            pool = new_pool
-            remaining = len(pool)
-            seq_rows.append({
-                "step": 0,
-                "filter_id": f"AFF_TOP{int(round(affinity_exclude_top_pct*100))}",
-                "name": f"Anti-affinity: drop top {int(round(affinity_exclude_top_pct*100))}%",
-                "eliminated_now": elim,
-                "remaining": remaining,
-                "skipped_reason": None,
-            })
+        keep_mask = aff_pct < thr
+        new_pool = [c for c, keep in zip(pool, keep_mask) if keep]
+        elim = len(pool) - len(new_pool)
+        pool = new_pool
+        remaining = len(pool)
+        seq_rows.append({
+            "step": 0,
+            "filter_id": f"AFF_TOP{int(round(affinity_exclude_top_pct*100))}",
+            "name": f"Anti-affinity: drop top {int(round(affinity_exclude_top_pct*100))}%",
+            "eliminated_now": elim,
+            "remaining": remaining,
+            "skipped_reason": None,
+        })
 
     # ===== Pair conflicts (for "avoid pairs" table) =====
     avoid_rows = []
@@ -909,24 +847,16 @@ def main(
         ["pair_risk","co_applicable_n"], ascending=[False,False]
     ).to_csv(OUTPUT_DIR / "avoid_pairs.csv", index=False)
 
-    # ===== Apply filters in order, but never remove the winner =====
+    # ===== Apply filters in order (NO winner guard) =====
     base_env = env_now
     final_pool = pool[:] if pool else None
 
     for step, f in enumerate(ranked, start=1):
-        fid = f.fid
         if final_pool is not None:
             new_pool, elim = apply_filter_to_pool(f, base_env, final_pool)
-            if always_keep_winner and (winner_today in final_pool) and (winner_today not in new_pool):
-                seq_rows.append({
-                    "step": step, "filter_id": fid, "name": f.name,
-                    "eliminated_now": 0, "remaining": remaining,
-                    "skipped_reason": "would_remove_winner"
-                })
-                continue
             if elim == 0:
                 seq_rows.append({
-                    "step": step, "filter_id": fid, "name": f.name,
+                    "step": step, "filter_id": f.fid, "name": f.name,
                     "eliminated_now": 0, "remaining": remaining,
                     "skipped_reason": "no_reduction"
                 })
@@ -934,7 +864,7 @@ def main(
             final_pool = new_pool
             remaining = len(final_pool)
             seq_rows.append({
-                "step": step, "filter_id": fid, "name": f.name,
+                "step": step, "filter_id": f.fid, "name": f.name,
                 "eliminated_now": elim, "remaining": remaining,
                 "skipped_reason": None
             })
@@ -942,7 +872,7 @@ def main(
                 break
         else:
             seq_rows.append({
-                "step": step, "filter_id": fid, "name": f.name,
+                "step": step, "filter_id": f.fid, "name": f.name,
                 "eliminated_now": None, "remaining": None,
                 "skipped_reason": None
             })
@@ -1008,9 +938,8 @@ def main(
     )
 
     # ===== One-pager (HTML) =====
-    seed_list = base_env['seed_digits_list']
+    seed_list = env_now['seed_digits_list']
     parity_major = "even>=3" if sum(1 for d in seed_list if d%2==0) >= 3 else "even<=2"
-    winner_kept = (winner_today in (final_pool or [])) if pool else True
 
     HTML_CSS = """<!doctype html><html lang='en'><head><meta charset='utf-8'>
 <title>DC5 Recommender — One-Pager</title>
@@ -1026,8 +955,6 @@ h2 { font-size: 18px; margin: 24px 0 8px; }
 .table th { background:#f8fafc; font-weight:700; }
 .kpi { background:#f8fafc; padding:8px 10px; border-radius:12px; border:1px solid #e2e8f0; display:inline-block; margin-right:8px; }
 .badge { display:inline-block; padding:6px 10px; border-radius:12px; background:#eef2ff; margin-right:8px; }
-.badge.ok { background:#ecfdf5; }
-.badge.bad { background:#fef2f2; }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
 </style></head><body><div class='wrap'>"""
 
@@ -1047,7 +974,7 @@ h2 { font-size: 18px; margin: 24px 0 8px; }
     avoid_df = pd.read_csv(avoid_path) if avoid_path.exists() else pd.DataFrame()
     avoid_sorted = avoid_df.sort_values(["pair_risk","co_applicable_n"], ascending=[False,False]) if not avoid_df.empty else avoid_df
 
-    applied_html = df_to_html_table(applied, ["step","filter_id","name","eliminated_now","remaining"], "No safe reduction steps.", 60)
+    applied_html = df_to_html_table(applied, ["step","filter_id","name","eliminated_now","remaining"], "No reduction steps.", 60)
     skipped_html = df_to_html_table(skipped, ["filter_id","name","skipped_reason"], "No steps were skipped.", 60)
     avoid_html   = df_to_html_table(avoid_sorted, ["filter_id_1","filter_id_2","pair_risk","both_blocked_n","co_applicable_n"], "No high-risk pairs in this bucket.", 20)
 
@@ -1084,27 +1011,19 @@ h2 { font-size: 18px; margin: 24px 0 8px; }
         "&nbsp;·&nbsp; <b>Structure:</b> {} &nbsp;·&nbsp; <b>Spread:</b> {} "
         "&nbsp;·&nbsp; <b>Parity:</b> {}</div>"
         "<div style='margin-top:8px'><span class='kpi'>Anti-affinity default: drop top {}%</span></div>"
-        "<div style='margin-top:8px'>"
-        "<span class='badge'>Applicable filters: {}</span>"
-        "<span class='badge {}'>{}</span>"
-        "<span class='badge'>Target: &lt; {}</span>"
-        "<span class='badge'>Final size: {}</span>"
-        "</div></div>"
+        "</div>"
     ).format(
-        html.escape(str(base_env['seed'])),
-        base_env['seed_sum'], html.escape(base_env['seed_sum_category']),
+        html.escape(str(env_now['seed'])),
+        env_now['seed_sum'], html.escape(env_now['seed_sum_category']),
         html.escape(classify_structure(seed_list)),
-        base_env['spread_seed'], parity_major,
+        env_now['spread_seed'],
+        _parity_major_label(env_now['seed_digits_list']),
         int(round((AFFINITY_EXCLUDE_TOP_PCT)*100)),
-        len(applicable),
-        "ok" if winner_kept else "bad", "Winner: " + ("KEPT" if winner_kept else "REMOVED"),
-        TARGET_MAX+1,
-        remaining if remaining is not None else "—"
     )
 
     html_doc = (
         HTML_CSS + snap +
-        "<div class='card'><h2>Apply in this order (winner-preserving)</h2>{}</div>".format(applied_html) +
+        "<div class='card'><h2>Apply in this order</h2>{}</div>".format(applied_html) +
         "<div class='card'><h2>Skipped steps</h2>{}</div>".format(skipped_html) +
         "<div class='card'><h2>Avoid combining (today’s bucket)</h2>{}</div>".format(avoid_html) +
         ("<div class='card'><h2>Today — historically safe filter pairs (NoPool)</h2>{}</div>".format(
@@ -1116,7 +1035,7 @@ h2 { font-size: 18px; margin: 24px 0 8px; }
             )
         ) if include_nopool_panel else "") +
         "<div class='card'><h2>Final Ordered SafeList (sequence-respecting)</h2>{}</div>".format(final_html) +
-        "<div class='card'><h2>Final SafeList — Safest-first (risk↑, support↓, eliminations↓)</h2>{}</div>".format(safest_html) +
+        "<div class='card'><h2>Final SafeList — Safest-first</h2>{}</div>".format(safest_html) +
         "<div class='card'><h2>Final SafeList — Grouped by Aggression (most ➜ least)</h2>{}</div>".format(grouped_html) +
         "</div></body></html>"
     )
