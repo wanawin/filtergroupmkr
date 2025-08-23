@@ -637,6 +637,142 @@ def build_final_safest_first_safelist(
     }
 
 # =============================================================================
+# Grouped-by-aggression SafeList (bins + safest-within-each)
+# =============================================================================
+def build_final_grouped_safelist(
+    safe_source_path: str | Path = "do_not_apply.csv",
+    avoid_pairs_path: str | Path = "avoid_pairs.csv",
+    seq_path: str | Path = "recommender_sequence.csv",
+    out_basename: str = "final_safe_grouped",
+) -> Optional[Dict[str, object]]:
+    # 1) inputs
+    safe_source_path  = Path(safe_source_path)
+    avoid_pairs_path  = Path(avoid_pairs_path)
+    seq_path          = Path(seq_path)
+    if not safe_source_path.exists() or not avoid_pairs_path.exists():
+        return None
+
+    safe_df = pd.read_csv(safe_source_path)
+    tier_col = _detect_col(safe_df, ["tier", "Tier", "TIER"])
+    fid_col  = _detect_col(safe_df, ["filter_id", "Filter ID", "FILTER_ID", "fid", "FID", "id"])
+    if not tier_col or not fid_col:
+        return None
+
+    safe_df[fid_col] = safe_df[fid_col].astype(str).str.strip()
+    safe_only = safe_df[safe_df[tier_col].astype(str).str.upper() == "SAFE"].copy()
+    metrics = (safe_only.rename(columns={fid_col: "filter_id"})
+               .drop_duplicates("filter_id")
+               .set_index("filter_id"))
+    safe_ids = set(metrics.index)
+
+    # 2) remove avoid-pair ids
+    ap_df = pd.read_csv(avoid_pairs_path)
+    fid1 = _detect_col(ap_df, ["filter_id_1", "FID1", "fid1"])
+    fid2 = _detect_col(ap_df, ["filter_id_2", "FID2", "fid2"])
+    if not fid1 or not fid2:
+        return None
+    ap_ids = set(ap_df[fid1].astype(str).str.strip()) | set(ap_df[fid2].astype(str).str.strip())
+    revised_ids = [fid for fid in safe_ids if fid not in ap_ids]
+
+    # 3) eliminations map from sequence
+    elim_map: Dict[str, float] = {}
+    if seq_path.exists():
+        try:
+            seq_df = pd.read_csv(seq_path)
+            seq_fid = _detect_col(seq_df, ["filter_id", "Filter ID", "FILTER_ID", "fid", "FID", "id"])
+            elim_col = _detect_col(seq_df, ["eliminated_now", "eliminations", "elim_count", "elimination_count", "elims"])
+            if seq_fid and elim_col:
+                tmp = (seq_df
+                       .assign(fid=seq_df[seq_fid].astype(str).str.strip(),
+                               elims=pd.to_numeric(seq_df[elim_col], errors="coerce").fillna(0.0))
+                       .groupby("fid", as_index=True)["elims"].sum())
+                elim_map = tmp.to_dict()
+        except Exception:
+            elim_map = {}
+
+    def risk_of(fid: str) -> float:
+        try: return float(metrics.loc[fid, "risk"])
+        except Exception: return 1e9
+
+    def support_of(fid: str) -> float:
+        try: return float(metrics.loc[fid, "support"])
+        except Exception: return -1e9
+
+    def elims_of(fid: str) -> float:
+        return float(elim_map.get(fid, 0.0))
+
+    # 4) bin edges and labels
+    def bin_label(e: float) -> str:
+        e = float(e)
+        if e <= 0: return "0 (no impact)"
+        if 1 <= e <= 60:   return "001–060 eliminations"
+        if 61 <= e <= 100: return "061–100 eliminations"
+        if 101 <= e <= 300:return "101–300 eliminations"
+        if 301 <= e <= 500:return "301–500 eliminations"
+        if 501 <= e <= 700:return "501–700 eliminations"
+        return "701+ eliminations"
+
+    # 5) score and group
+    rows = []
+    for fid in revised_ids:
+        rows.append({
+            "filter_id": fid,
+            "risk": risk_of(fid),
+            "support": support_of(fid),
+            "elims": elims_of(fid),
+            "group": bin_label(elims_of(fid)),
+        })
+    if not rows:
+        return None
+    df = pd.DataFrame(rows)
+
+    # within-group: safest (risk asc), support desc, elims desc
+    df = df.sort_values(["group","risk","support","elims"],
+                        ascending=[True, True, False, False])
+
+    # group order: most aggressive to least
+    group_order = [
+        "701+ eliminations",
+        "501–700 eliminations",
+        "301–500 eliminations",
+        "101–300 eliminations",
+        "061–100 eliminations",
+        "001–060 eliminations",
+        "0 (no impact)",
+    ]
+    df["group"] = pd.Categorical(df["group"], categories=group_order, ordered=True)
+    df = df.sort_values(["group","risk","support","elims"], ascending=[True, True, False, False])
+
+    # join back extra metrics cols if present
+    out_df = df.merge(metrics.reset_index(), on="filter_id", how="left")
+
+    # outputs
+    from datetime import datetime
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    base = f"{out_basename}_{ts}"
+    out_csv = OUTPUT_DIR / f"{base}.csv"
+    out_txt = OUTPUT_DIR / f"{base}.txt"
+    out_html = OUTPUT_DIR / f"{base}.html"
+
+    out_df.to_csv(out_csv, index=False)
+    with open(out_txt, "w", encoding="utf-8") as f:
+        current = None
+        for _, r in out_df.iterrows():
+            if r["group"] != current:
+                current = r["group"]
+                f.write(f"\n### {current}\n")
+            f.write(f"{r['filter_id']}\n")
+    # HTML with group headers
+    parts = []
+    for grp, gdf in out_df.groupby("group", sort=False):
+        hdr = f"<h3 style='margin:8px 0'>{html.escape(str(grp))}</h3>"
+        parts.append(hdr + gdf.drop(columns=["group"]).to_html(index=False, border=0))
+    with open(out_html, "w", encoding="utf-8") as fh:
+        fh.write("<html><body>" + "\n".join(parts) + "</body></html>")
+
+    return {"outputs": {"csv": str(out_csv), "txt": str(out_txt), "html": str(out_html)}, "groups": out_df["group"].unique().tolist()}
+
+# =============================================================================
 # Public entry
 # =============================================================================
 def main(
@@ -781,7 +917,7 @@ def main(
         fid = f.fid
         if final_pool is not None:
             new_pool, elim = apply_filter_to_pool(f, base_env, final_pool)
-            if ALWAYS_KEEP_WINNER and (winner_today in final_pool) and (winner_today not in new_pool):
+            if always_keep_winner and (winner_today in final_pool) and (winner_today not in new_pool):
                 seq_rows.append({
                     "step": step, "filter_id": fid, "name": f.name,
                     "eliminated_now": 0, "remaining": remaining,
@@ -864,6 +1000,13 @@ def main(
         out_basename="final_safe_safest_first",
     )
 
+    final_safe_grouped_meta = build_final_grouped_safelist(
+        safe_source_path=OUTPUT_DIR / "do_not_apply.csv",
+        avoid_pairs_path=OUTPUT_DIR / "avoid_pairs.csv",
+        seq_path=OUTPUT_DIR / "recommender_sequence.csv",
+        out_basename="final_safe_grouped",
+    )
+
     # ===== One-pager (HTML) =====
     seed_list = base_env['seed_digits_list']
     parity_major = "even>=3" if sum(1 for d in seed_list if d%2==0) >= 3 else "even<=2"
@@ -888,8 +1031,10 @@ h2 { font-size: 18px; margin: 24px 0 8px; }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
 </style></head><body><div class='wrap'>"""
 
-    applied = seq_df[seq_df["eliminated_now"].notna() & (seq_df["eliminated_now"]>0)]
-    skipped = seq_df[seq_df["skipped_reason"].notna() & (seq_df["skipped_reason"]!="")]
+    applied = pd.DataFrame(seq_rows)
+    applied = applied[(applied["eliminated_now"].notna()) & (applied["eliminated_now"]>0)]
+    skipped = pd.DataFrame(seq_rows)
+    skipped = skipped[(skipped["skipped_reason"].notna()) & (skipped["skipped_reason"]!="")]
 
     def df_to_html_table(df: pd.DataFrame, columns: list, empty_msg: str, limit: int = None):
         if df is None or df.empty:
@@ -921,6 +1066,15 @@ h2 { font-size: 18px; margin: 24px 0 8px; }
         try:
             sf_df = pd.read_csv(final_safe_safest_meta["outputs"]["csv"])
             safest_html = df_to_html_table(sf_df, [], "Safest-first list is empty.", None if len(sf_df)<=400 else 400)
+        except Exception:
+            pass
+
+    # Grouped-by-aggression
+    grouped_html = "<p class='muted mono'>Grouped SafeList not built (missing inputs).</p>"
+    if final_safe_grouped_meta and final_safe_grouped_meta.get("outputs", {}).get("html"):
+        try:
+            html_path = final_safe_grouped_meta["outputs"]["html"]
+            grouped_html = Path(html_path).read_text(encoding="utf-8")
         except Exception:
             pass
 
@@ -963,6 +1117,7 @@ h2 { font-size: 18px; margin: 24px 0 8px; }
         ) if include_nopool_panel else "") +
         "<div class='card'><h2>Final Ordered SafeList (sequence-respecting)</h2>{}</div>".format(final_html) +
         "<div class='card'><h2>Final SafeList — Safest-first (risk↑, support↓, eliminations↓)</h2>{}</div>".format(safest_html) +
+        "<div class='card'><h2>Final SafeList — Grouped by Aggression (most ➜ least)</h2>{}</div>".format(grouped_html) +
         "</div></body></html>"
     )
 
@@ -974,7 +1129,8 @@ __all__ = [
     "TARGET_MAX","ALWAYS_KEEP_WINNER","MINIMIZE_BEYOND_TARGET",
     "AFFINITY_EXCLUDE_TOP_PCT",
     "main","combo_affinity","get_pool_for_seed","nopool_today_pairs",
-    "build_final_ordered_safelist","build_final_safest_first_safelist"
+    "build_final_ordered_safelist","build_final_safest_first_safelist",
+    "build_final_grouped_safelist"
 ]
 
 if __name__ == "__main__":
