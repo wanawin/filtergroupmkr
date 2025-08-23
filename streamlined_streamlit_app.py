@@ -1,8 +1,7 @@
 import streamlit as st
 import pandas as pd
 from pathlib import Path
-
-st.set_page_config(page_title="DCS Recommender — Streamlined", layout="wide")
+import sys, traceback, importlib
 
 # ========================
 # Paths (repo-root relative)
@@ -13,6 +12,8 @@ DEFAULT_POOL    = "today_pool.csv"
 CASE_HISTORY    = "case_history.csv"
 CASE_STATS      = "case_filter_stats.csv"
 OUT_DIR         = Path(".")
+
+st.set_page_config(page_title="DCS Recommender — Streamlined", layout="wide")
 
 # ---------- helpers ----------
 def _fmt_dt(path: Path) -> str:
@@ -27,71 +28,29 @@ def _exists_info(path_str: str):
     p = Path(path_str)
     return p.exists(), p
 
-def _latest(path_glob: str) -> Path | None:
-    files = list(Path(".").glob(path_glob))
-    if not files:
-        return None
-    return max(files, key=lambda p: p.stat().st_mtime)
+def _latest(glob_pat: str) -> Path | None:
+    files = list(Path(".").glob(glob_pat))
+    return max(files, key=lambda p: p.stat().st_mtime) if files else None
 
-def _resolve_recommender_main():
-    """
-    Try to get recommender.main with multiple strategies:
-    1) Normal import
-    2) Load from known file locations with importlib
-    Returns (callable_main, debug_info_str)
-    """
-    debug = []
-    try:
-        import recommender  # type: ignore
-        return recommender.main, "Loaded via normal import."
-    except Exception as e:
-        debug.append(f"Normal import failed: {e!r}")
+@st.cache_data(show_spinner=False)
+def _read_csv_cached(path_str: str, mtime: float):
+    # mtime is used solely to bust cache when the file updates
+    return pd.read_csv(path_str)
 
-    import importlib.util, sys, os
-
-    # Candidate locations to try explicitly
-    here = Path(__file__).parent if "__file__" in globals() else Path.cwd()
-    candidates = [
-        here / "recommender.py",
-        Path.cwd() / "recommender.py",
-        here.parent / "recommender.py",
-        Path.cwd() / "app" / "recommender.py",
-        Path.cwd() / "src" / "recommender.py",
-    ]
-    tried = []
-    for cand in candidates:
-        tried.append(str(cand))
-        if cand.exists():
-            try:
-                spec = importlib.util.spec_from_file_location("recommender", cand)
-                if spec and spec.loader:
-                    mod = importlib.util.module_from_spec(spec)
-                    spec.loader.exec_module(mod)  # type: ignore[attr-defined]
-                    if hasattr(mod, "main"):
-                        return getattr(mod, "main"), f"Loaded from file: {cand}"
-            except Exception as e2:
-                debug.append(f"Load from {cand} failed: {e2!r}")
-
-    # Last ditch: if a folder named recommender exists, show hint about name clash
-    if (Path.cwd() / "recommender").is_dir():
-        debug.append("A folder named 'recommender/' exists — Python may try to import that package instead of recommender.py.")
-
-    # Collect environment info
-    env_info = []
-    env_info.append(f"CWD: {Path.cwd()}")
-    env_info.append(f"__file__ base: {here}")
-    try:
-        env_info.append("Files in CWD: " + ", ".join(sorted(p.name for p in Path.cwd().iterdir())))
-    except Exception:
-        pass
-    import sys as _sys
-    env_info.append("sys.path:\n" + "\n".join(f"  - {p}" for p in _sys.path))
-    env_info.append("Tried locations:\n" + "\n".join(f"  - {p}" for p in tried))
-
-    return None, "\n".join(env_info + ["\nDebug notes:"] + debug)
+# Simple CSS for group headers
+st.markdown("""
+<style>
+.group-header{
+  padding:8px 12px; margin:18px 0 8px;
+  border-left:8px solid #0ea5e9; background:#f0f9ff;
+  border-radius:8px; font-weight:600;
+}
+.small-muted{color:#64748b; font-size:12px;}
+</style>
+""", unsafe_allow_html=True)
 
 # ---------- Step 1: Build / refresh profiler tables ----------
-with st.expander("Step 1 — Build or update case tables (Profiler)", expanded=True):
+with st.expander("Step 1 — Build or update case tables (Profiler)", expanded=False):
     c1, c2 = st.columns(2)
     with c1:
         winners_path = st.text_input("Winners CSV path (in repo)", DEFAULT_WINNERS, key="winners_step1")
@@ -137,7 +96,7 @@ with st.expander("Step 1 — Build or update case tables (Profiler)", expanded=T
 
 # ---------- Step 2: Run recommender ----------
 st.markdown("---")
-st.subheader("Step 2 — Run recommender (winner-preserving)")
+st.subheader("Step 2 — Run recommender (winner prediction)")
 
 with st.form("run_form"):
     c1, c2 = st.columns(2)
@@ -156,7 +115,6 @@ with st.form("run_form"):
     submitted = st.form_submit_button("Run recommender now", type="primary")
 
 if submitted:
-    # Validation: ensure 5-digit numeric strings where filled
     invalids = []
     for field_name, value in [("Seed", seed), ("Prev seed", prev_seed), ("Prev-prev seed", prev_prev_seed), ("Keep combo", keep_combo)]:
         if value and (not value.isdigit() or len(value) != 5):
@@ -169,7 +127,7 @@ if submitted:
             winners_csv=winners_csv,
             filters_csv=filters_csv,
             today_pool_csv=DEFAULT_POOL if Path(DEFAULT_POOL).exists() else None,
-            always_keep_winner=True,
+            always_keep_winner=False,  # backtest-friendly
             minimize_beyond_target=minimize_beyond_target,
             force_keep_combo=keep_combo or None,
             override_seed=seed or None,
@@ -178,164 +136,146 @@ if submitted:
             applicable_only=ids or None,
         )
 
-        # Robustly load recommender.main
-        run_recommender, dbg = _resolve_recommender_main()
-        if run_recommender is None:
-            st.error("❌ Could not import **recommender.py**. See diagnostics below.")
-            with st.expander("Import diagnostics", expanded=True):
-                import sys, os
-                st.code(dbg)
-            st.stop()
-
         try:
-            result = run_recommender(**kwargs)
-            st.success("✅ Recommender finished")
-
-            # ---- Additional NoPool panel ----
-            nopool_csv = Path("NoPool_today_pairs_TOP.csv")
-            if nopool_csv.exists():
-                try:
-                    df_np = pd.read_csv(nopool_csv)
-                    if df_np.empty:
-                        st.info("No additional NoPool recommendations today (min_days=60, min_keep=75%). See one_pager.html for details.")
-                    else:
-                        st.success(f"Additional NoPool recommendations: {len(df_np)} pair(s). See one_pager.html for details.")
-                        st.dataframe(df_np.head(20), use_container_width=True)
-                except Exception as e:
-                    st.warning(f"Could not read {nopool_csv.name}: {e}")
-            else:
-                st.info("NoPool summary file not found. (Feature may be off or no pairs qualified.)")
-
-            # ---- Show outputs if present ----
-            outputs = [
-                "recommender_sequence.csv",
-                "pool_reduction_log.csv",
-                "avoid_pairs.csv",
-                "do_not_apply.csv",
-                "one_pager.md",
-                "one_pager.html",
-            ]
-            for fname in outputs:
-                p = OUT_DIR / fname
-                if p.exists():
-                    st.write(f"**{fname}** — updated {_fmt_dt(p)}")
-                    if p.suffix == ".md":
-                        st.markdown(p.read_text(encoding="utf-8"))
-                    elif p.suffix == ".html":
-                        st.download_button(
-                            "Download one_pager.html",
-                            data=p.read_bytes(),
-                            file_name="one_pager.html",
-                        )
-                    else:
-                        try:
-                            st.dataframe(pd.read_csv(p), use_container_width=True)
-                        except Exception:
-                            st.code(p.read_text(encoding='utf-8')[:5000])
-
-            # --- Final Ordered SafeList — Sequence-first ---
-            st.markdown("---")
-            st.subheader("Final Ordered SafeList — Sequence-first")
-            latest_csv  = _latest("final_safe_ordered_*.csv")
-            latest_txt  = _latest("final_safe_ordered_*.txt")
-            latest_html = _latest("final_safe_ordered_*.html")
-
-            if latest_csv and latest_csv.exists():
-                try:
-                    df_final = pd.read_csv(latest_csv)
-                    show_all = st.toggle("Show all rows (sequence-first)", value=False)
-                    if show_all:
-                        st.dataframe(
-                            df_final,
-                            use_container_width=True,
-                            hide_index=True,
-                            height=min(700, 40 + 28 * len(df_final))
-                        )
-                    else:
-                        st.caption("Showing first 100 rows (toggle above to show everything).")
-                        st.dataframe(
-                            df_final.head(100),
-                            use_container_width=True,
-                            hide_index=True,
-                            height=700
-                        )
-
-                    fmt = st.radio("Download format (sequence-first)", ["CSV", "TXT", "HTML"], horizontal=True)
-                    selected_path = {
-                        "CSV": latest_csv,
-                        "TXT": latest_txt if latest_txt and latest_txt.exists() else latest_csv,
-                        "HTML": latest_html if latest_html and latest_html.exists() else latest_csv,
-                    }[fmt]
-                    mime = "text/csv" if fmt == "CSV" else "text/plain" if fmt == "TXT" else "text/html"
-                    with open(selected_path, "rb") as fh:
-                        st.download_button(
-                            f"Download Final SafeList — Sequence-first ({fmt})",
-                            data=fh,
-                            file_name=selected_path.name,
-                            mime=mime,
-                            type="primary",
-                        )
-                    st.caption(
-                        f"Files: {latest_csv.name}"
-                        + (f", {latest_txt.name}" if latest_txt else "")
-                        + (f", {latest_html.name}" if latest_html else "")
-                    )
-                except Exception:
-                    st.info("Final SafeList files were written, but couldn’t render the table here.")
-            else:
-                st.info("No Sequence-first list found yet. Make sure do_not_apply.csv and avoid_pairs.csv were present when the recommender ran.")
-
-            # --- Final Ordered SafeList — Safest-first ---
-            st.markdown("---")
-            st.subheader("Final Ordered SafeList — Safest-first")
-            latest_csv2  = _latest("final_safe_safest_first_*.csv")
-            latest_txt2  = _latest("final_safe_safest_first_*.txt")
-            latest_html2 = _latest("final_safe_safest_first_*.html")
-
-            if latest_csv2 and latest_csv2.exists():
-                try:
-                    df_final2 = pd.read_csv(latest_csv2)
-                    show_all2 = st.toggle("Show all rows (safest-first)", value=False)
-                    if show_all2:
-                        st.dataframe(
-                            df_final2,
-                            use_container_width=True,
-                            hide_index=True,
-                            height=min(700, 40 + 28 * len(df_final2))
-                        )
-                    else:
-                        st.caption("Showing first 100 rows (toggle above to show everything).")
-                        st.dataframe(
-                            df_final2.head(100),
-                            use_container_width=True,
-                            hide_index=True,
-                            height=700
-                        )
-
-                    fmt2 = st.radio("Download format (safest-first)", ["CSV", "TXT", "HTML"], horizontal=True)
-                    selected2 = {
-                        "CSV": latest_csv2,
-                        "TXT": latest_txt2 if latest_txt2 and latest_txt2.exists() else latest_csv2,
-                        "HTML": latest_html2 if latest_html2 and latest_html2.exists() else latest_csv2,
-                    }[fmt2]
-                    mime2 = "text/csv" if fmt2 == "CSV" else "text/plain" if fmt2 == "TXT" else "text/html"
-                    with open(selected2, "rb") as fh2:
-                        st.download_button(
-                            f"Download Final SafeList — Safest-first ({fmt2})",
-                            data=fh2,
-                            file_name=selected2.name,
-                            mime=mime2,
-                            type="primary",
-                        )
-                    st.caption(
-                        f"Files: {latest_csv2.name}"
-                        + (f", {latest_txt2.name}" if latest_txt2 else "")
-                        + (f", {latest_html2.name}" if latest_html2 else "")
-                    )
-                except Exception:
-                    st.info("Safest-first files were written, but couldn’t render the table here.")
-            else:
-                st.info("No Safest-first list found yet. Run the recommender first.")
-
+            if "recommender" in sys.modules:
+                del sys.modules["recommender"]
+            recommender = importlib.import_module("recommender")
+            run_recommender = recommender.main
         except Exception as e:
-            st.exception(e)
+            st.error("❌ Could not import recommender.py. See diagnostics below.")
+            with st.expander("Import diagnostics"):
+                st.code("".join(traceback.format_exception_only(type(e), e)))
+                st.write("sys.path:", sys.path)
+                st.write("CWD:", str(Path.cwd()))
+                st.write("Files in CWD:", ", ".join(sorted(p.name for p in Path('.').iterdir())))
+        else:
+            try:
+                _ = run_recommender(**kwargs)
+                st.success("✅ Recommender finished")
+                st.session_state["last_run_ok"] = True
+            except Exception as e:
+                st.exception(e)
+
+# ---- Always-visible outputs (persist across re-runs) ----
+st.markdown("---")
+st.subheader("Latest outputs on disk (auto-refresh)")
+
+# Core files
+outputs = [
+    "recommender_sequence.csv",
+    "pool_reduction_log.csv",
+    "avoid_pairs.csv",
+    "do_not_apply.csv",
+    "one_pager.html",
+]
+for fname in outputs:
+    p = OUT_DIR / fname
+    if p.exists():
+        st.write(f"**{fname}** — updated {_fmt_dt(p)}")
+        if p.suffix == ".html":
+            st.download_button("Download one_pager.html", data=p.read_bytes(), file_name="one_pager.html")
+        else:
+            try:
+                df = _read_csv_cached(str(p), p.stat().st_mtime)
+                st.dataframe(df, use_container_width=True, hide_index=True)
+            except Exception:
+                st.code(p.read_text(encoding="utf-8")[:5000])
+
+# ---- Final SafeLists section (persisted + group delineation) ----
+st.markdown("---")
+st.subheader("Final SafeLists")
+
+tabs = st.tabs(["Sequence-biased", "Safest-first", "Grouped by aggressiveness"])
+
+def _show_table_with_row_choice(df: pd.DataFrame, key_prefix: str):
+    choice = st.radio("Rows to show", ["100", "300", "All"], horizontal=True, key=f"{key_prefix}_rows")
+    if choice == "All":
+        st.dataframe(df, use_container_width=True, hide_index=True, height=min(900, 40 + 28 * len(df)))
+    else:
+        n = int(choice)
+        st.dataframe(df.head(n), use_container_width=True, hide_index=True, height=700)
+
+def _bucket_from_elims(c: float) -> str:
+    try:
+        c = float(c)
+    except Exception:
+        c = 0.0
+    if c >= 701: return "701+"
+    if c >= 501: return "501–700"
+    if c >= 301: return "301–500"
+    if c >= 101: return "101–300"
+    if c >=  61: return "61–100"
+    if c >=   1: return "1–60"
+    return "0"
+
+def _download_buttons(latest_csv: Path | None, latest_txt: Path | None, latest_html: Path | None, key_prefix: str):
+    if not latest_csv:
+        return
+    fmt = st.radio("Download format", ["CSV", "TXT", "HTML"], horizontal=True, key=f"{key_prefix}_dlfmt")
+    selected = {"CSV": latest_csv,
+                "TXT": latest_txt if (latest_txt and latest_txt.exists()) else latest_csv,
+                "HTML": latest_html if (latest_html and latest_html.exists()) else latest_csv}[fmt]
+    mime = "text/csv" if fmt=="CSV" else "text/plain" if fmt=="TXT" else "text/html"
+    with open(selected, "rb") as fh:
+        st.download_button(f"Download ({fmt})", data=fh, file_name=selected.name, mime=mime, key=f"{key_prefix}_dlbtn")
+
+# Tab 1: Sequence-biased
+with tabs[0]:
+    latest_csv  = _latest("final_safe_ordered_*.csv")
+    latest_txt  = _latest("final_safe_ordered_*.txt")
+    latest_html = _latest("final_safe_ordered_*.html")
+    if latest_csv:
+        st.caption(f"File: {latest_csv.name}")
+        df = _read_csv_cached(str(latest_csv), latest_csv.stat().st_mtime)
+        _show_table_with_row_choice(df, "seq")
+        _download_buttons(latest_csv, latest_txt, latest_html, "seq")
+    else:
+        st.info("No sequence-biased list found yet.")
+
+# Tab 2: Safest-first
+with tabs[1]:
+    latest_csv  = _latest("final_safe_safest_first_*.csv")
+    latest_txt  = _latest("final_safe_safest_first_*.txt")
+    latest_html = _latest("final_safe_safest_first_*.html")
+    if latest_csv:
+        st.caption(f"File: {latest_csv.name}")
+        df = _read_csv_cached(str(latest_csv), latest_csv.stat().st_mtime)
+        _show_table_with_row_choice(df, "safest")
+        _download_buttons(latest_csv, latest_txt, latest_html, "safest")
+    else:
+        st.info("No safest-first list found yet.")
+
+# Tab 3: Grouped by aggressiveness (with clear headers)
+with tabs[2]:
+    latest_csv  = _latest("final_safe_grouped_*.csv")
+    latest_txt  = _latest("final_safe_grouped_*.txt")
+    latest_html = _latest("final_safe_grouped_*.html")
+    if latest_csv:
+        st.caption(f"File: {latest_csv.name}")
+        df = _read_csv_cached(str(latest_csv), latest_csv.stat().st_mtime)
+
+        # ensure there is a 'group' column even if older file lacks it
+        if "group" not in df.columns:
+            # try to derive from elim_count if present
+            if "elim_count" in df.columns:
+                df["group"] = df["elim_count"].map(_bucket_from_elims)
+            else:
+                df["group"] = "unknown"
+
+        order_buckets = ["701+","501–700","301–500","101–300","61–100","1–60","0","unknown"]
+        for grp in order_buckets:
+            block = df[df["group"] == grp]
+            if block.empty:
+                continue
+            st.markdown(f"<div class='group-header'>{grp} — {len(block)} filters</div>", unsafe_allow_html=True)
+            choice_key = f"group_{grp.replace('–','-').replace('+','plus')}"
+            choice = st.radio("Rows to show", ["50", "All"], horizontal=True, key=choice_key)
+            if choice == "All":
+                st.dataframe(block, use_container_width=True, hide_index=True, height=min(800, 40 + 28 * len(block)))
+            else:
+                st.dataframe(block.head(50), use_container_width=True, hide_index=True, height=500)
+            st.markdown("<div class='small-muted'>— end of group —</div>", unsafe_allow_html=True)
+
+        _download_buttons(latest_csv, latest_txt, latest_html, "grouped")
+    else:
+        st.info("No grouped list found yet.")
