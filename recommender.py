@@ -31,6 +31,7 @@ POOL_ARCHIVE_DIR = Path("pools")
 # =============================================================================
 # Pool archive helpers
 # =============================================================================
+
 def get_pool_for_seed(seed_row: pd.Series, *, keep_permutations: bool = True) -> pd.DataFrame:
     """
     Load the EXACT pool your app had at the pre-CSV stage for this seed's date.
@@ -129,8 +130,6 @@ def build_env_for_draw(idx: int, winners: List[str]) -> Dict[str, object]:
     history_digits = [digits_of(s) for s in winners[:idx]]
     hot, cold, due = hot_cold_due(history_digits, k_hotcold=10)
 
-    def parity_label(digs): return "Even" if sum(digs) % 2 == 0 else "Odd"
-
     env = {
         "combo": winner,
         "combo_digits": set(combo_list),
@@ -210,7 +209,7 @@ def load_filters(path: str) -> List[FilterDef]:
     out: List[FilterDef] = []
     for _, r in df.iterrows():
         out.append(FilterDef(
-            str(r["id"]).strip(),
+            str(r["id"]).strip().upper(),   # normalize IDs to UPPERCASE
             str(r["name"]).strip(),
             bool(r["enabled"]),
             str(r["applicable_if"]).strip(),
@@ -221,8 +220,10 @@ def load_filters(path: str) -> List[FilterDef]:
 # =============================================================================
 # Affinity (used ONLY to rank by similarity for pre-trim)
 # =============================================================================
+
 def _parity_major_label(digs: List[int]) -> str:
     return "even>=3" if sum(1 for d in digs if d % 2 == 0) >= 3 else "even<=2"
+
 
 def classify_structure(digs: List[int]) -> str:
     c = Counter(digs); counts = sorted(c.values(), reverse=True)
@@ -233,6 +234,7 @@ def classify_structure(digs: List[int]) -> str:
     if counts == [2,2,1]:   return "double_double"
     if counts == [2,1,1,1]: return "double"
     return "single"
+
 
 def combo_affinity(env_now: Dict[str, object], combo: str) -> float:
     """
@@ -270,6 +272,7 @@ def combo_affinity(env_now: Dict[str, object], combo: str) -> float:
 # =============================================================================
 # Risk (history-only) + helpers
 # =============================================================================
+
 def safe_eval(expr: str, env: Dict[str, object]) -> bool:
     if not expr:
         return True
@@ -277,6 +280,7 @@ def safe_eval(expr: str, env: Dict[str, object]) -> bool:
         return bool(eval(expr, {"__builtins__": {}}, env))
     except Exception:
         return False
+
 
 def historical_risk_for_applicable(
     filters: List[FilterDef],
@@ -328,6 +332,7 @@ def historical_risk_for_applicable(
         pair_risk[(a,b)] = bb / n if n > 0 else 0.0
     return single_failure_rate, pair_risk, candidate_indices
 
+
 def today_applicable_filters(filters: List[FilterDef], winners: List[str]):
     if len(winners) < 2:
         raise SystemExit("Need at least 2 winners.")
@@ -338,6 +343,7 @@ def today_applicable_filters(filters: List[FilterDef], winners: List[str]):
         if f.enabled and safe_eval(f.applicable_if, env_now):
             app[f.fid] = f
     return idx_now, app, env_now
+
 
 def apply_filter_to_pool(f: FilterDef, base_env: Dict[str,object], pool: List[str]) -> Tuple[List[str], int]:
     keep, elim = [], 0
@@ -363,6 +369,7 @@ def apply_filter_to_pool(f: FilterDef, base_env: Dict[str,object], pool: List[st
 # =============================================================================
 # Public entry
 # =============================================================================
+
 def main(
     winners_csv: Optional[str] = None,
     filters_csv: Optional[str] = None,
@@ -370,7 +377,7 @@ def main(
     target_max: int = TARGET_MAX,
     always_keep_winner: bool = ALWAYS_KEEP_WINNER,
     minimize_beyond_target: bool = MINIMIZE_BEYOND_TARGET,
-    force_keep_combo: Optional[str] = None,   # <— make sure this is present
+    force_keep_combo: Optional[str] = None,   # <— used to pin a combo in-pool
     override_seed: Optional[str] = None,
     override_prev: Optional[str] = None,
     override_prevprev: Optional[str] = None,
@@ -396,6 +403,11 @@ def main(
 
     idx_now, applicable, env_now = today_applicable_filters(filters, winners)
 
+    # Restrict to Applicable-Only (case-insensitive)
+    if applicable_only:
+        allow = {str(fid).strip().upper() for fid in applicable_only}
+        applicable = {fid: f for fid, f in applicable.items() if fid.upper() in allow}
+
     # Get today's pool
     if today_pool_csv:
         df_pool = pd.read_csv(today_pool_csv)
@@ -412,7 +424,12 @@ def main(
         pool = pool_df["combo"].astype(str).tolist()
 
     remaining = len(pool)
-    winner_today = winners[idx_now] if pool else None
+
+    # Winner to preserve: either explicit force_keep_combo, or the true winner at idx_now
+    if force_keep_combo:
+        winner_today = str(force_keep_combo).strip().replace(" ", "").zfill(5)
+    else:
+        winner_today = winners[idx_now] if pool else None
 
     seq_rows = []  # step log
 
@@ -508,8 +525,8 @@ def main(
 
         if final_pool is not None:
             new_pool, elim = apply_filter_to_pool(f, base_env, final_pool)
-            if always_keep_winner and (winner_today in final_pool) and (winner_today not in new_pool):
-                # Skip if this step would remove the winner
+            if always_keep_winner and winner_today and (winner_today in final_pool) and (winner_today not in new_pool):
+                # Skip if this step would remove the pinned/winner combo
                 seq_rows.append({
                     "step": step, "filter_id": fid, "name": f.name,
                     "eliminated_now": 0, "remaining": remaining,
@@ -563,14 +580,14 @@ def main(
         do_not_df = do_not_df.sort_values(
             by=["tier","risk","support","filter_id"],
             ascending=[True, False, False, True],
-           key=lambda s: s.map(tier_order) if s.name == "tier" else s
+            key=lambda s: s.map(tier_order) if s.name == "tier" else s
         )
         do_not_df.to_csv(OUTPUT_DIR / "do_not_apply.csv", index=False)
 
     # One-pager (HTML)
     seed_list = base_env['seed_digits_list']
     parity_major = "even>=3" if sum(1 for d in seed_list if d%2==0) >= 3 else "even<=2"
-    winner_kept = (winner_today in (final_pool or [])) if pool else True
+    winner_kept = (winner_today in (final_pool or [])) if (final_pool is not None) else True
 
     HTML_CSS = """<!doctype html><html lang='en'><head><meta charset='utf-8'>
 <title>DC5 Recommender — One-Pager</title>
