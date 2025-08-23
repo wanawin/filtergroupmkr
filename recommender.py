@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 
 # =============================================================================
-# Defaults you can change (the UI can still override these if your app passes args)
+# Defaults (UI can override)
 # =============================================================================
 WINNERS_CSV = "DC5_Midday_Full_Cleaned_Expanded.csv"
 FILTERS_CSV = "lottery_filters_batch_10.csv"
@@ -23,23 +23,27 @@ MINIMIZE_BEYOND_TARGET = True
 OUTPUT_DIR = Path(".")
 
 # Anti-affinity default: trim OFF the top X% most seed-like combos
-AFFINITY_EXCLUDE_TOP_PCT = 0.25   # 25% is a good starting default from your tests
+AFFINITY_EXCLUDE_TOP_PCT = 0.25
 
-# Where dated pools live, e.g. pools/pool_2025-08-22.csv
+# Where dated pools live, e.g., pools/pool_2025-08-22.csv
 POOL_ARCHIVE_DIR = Path("pools")
+
+# --- NoPool integration knobs (historical signals; no simulated pool) ---
+INCLUDE_NOPOOL_PANEL = True
+NOPOOL_MIN_DAYS      = 60       # require both-applicable on ≥ this many days
+NOPOOL_MIN_KEEP      = 75.0     # show pairs with winner-kept ≥ this %
+NOPOOL_PARITY_SKEW   = 10.0     # show parity only if abs(50 - even%) ≥ this
+NOPOOL_MAX_ROWS      = 20       # how many pairs to list in the panel
 
 # =============================================================================
 # Pool archive helpers
 # =============================================================================
-
 def get_pool_for_seed(seed_row: pd.Series, *, keep_permutations: bool = True) -> pd.DataFrame:
     """
     Load the EXACT pool your app had at the pre-CSV stage for this seed's date.
-
     Strategy:
       1) If seed_row has a Date/DrawDate, try pools/pool_YYYY-MM-DD.csv
       2) Else/fallback to TODAY_POOL_CSV or repo-root today_pool.csv
-
     Returns a DataFrame with a 'combo' column of 5-digit strings.
     """
     date_val = None
@@ -209,7 +213,7 @@ def load_filters(path: str) -> List[FilterDef]:
     out: List[FilterDef] = []
     for _, r in df.iterrows():
         out.append(FilterDef(
-            str(r["id"]).strip().upper(),   # normalize IDs to UPPERCASE
+            str(r["id"]).strip(),
             str(r["name"]).strip(),
             bool(r["enabled"]),
             str(r["applicable_if"]).strip(),
@@ -220,10 +224,8 @@ def load_filters(path: str) -> List[FilterDef]:
 # =============================================================================
 # Affinity (used ONLY to rank by similarity for pre-trim)
 # =============================================================================
-
 def _parity_major_label(digs: List[int]) -> str:
     return "even>=3" if sum(1 for d in digs if d % 2 == 0) >= 3 else "even<=2"
-
 
 def classify_structure(digs: List[int]) -> str:
     c = Counter(digs); counts = sorted(c.values(), reverse=True)
@@ -234,7 +236,6 @@ def classify_structure(digs: List[int]) -> str:
     if counts == [2,2,1]:   return "double_double"
     if counts == [2,1,1,1]: return "double"
     return "single"
-
 
 def combo_affinity(env_now: Dict[str, object], combo: str) -> float:
     """
@@ -272,7 +273,6 @@ def combo_affinity(env_now: Dict[str, object], combo: str) -> float:
 # =============================================================================
 # Risk (history-only) + helpers
 # =============================================================================
-
 def safe_eval(expr: str, env: Dict[str, object]) -> bool:
     if not expr:
         return True
@@ -280,7 +280,6 @@ def safe_eval(expr: str, env: Dict[str, object]) -> bool:
         return bool(eval(expr, {"__builtins__": {}}, env))
     except Exception:
         return False
-
 
 def historical_risk_for_applicable(
     filters: List[FilterDef],
@@ -332,7 +331,6 @@ def historical_risk_for_applicable(
         pair_risk[(a,b)] = bb / n if n > 0 else 0.0
     return single_failure_rate, pair_risk, candidate_indices
 
-
 def today_applicable_filters(filters: List[FilterDef], winners: List[str]):
     if len(winners) < 2:
         raise SystemExit("Need at least 2 winners.")
@@ -343,7 +341,6 @@ def today_applicable_filters(filters: List[FilterDef], winners: List[str]):
         if f.enabled and safe_eval(f.applicable_if, env_now):
             app[f.fid] = f
     return idx_now, app, env_now
-
 
 def apply_filter_to_pool(f: FilterDef, base_env: Dict[str,object], pool: List[str]) -> Tuple[List[str], int]:
     keep, elim = [], 0
@@ -367,9 +364,112 @@ def apply_filter_to_pool(f: FilterDef, base_env: Dict[str,object], pool: List[st
     return keep, elim
 
 # =============================================================================
+# NoPool (historical signals without pool) — TODAY'S applicable pairs only
+# =============================================================================
+def nopool_today_pairs(
+    winners: List[str],
+    filters_all: Dict[str, FilterDef],
+    idx_now: int,
+    *, min_days: int = NOPOOL_MIN_DAYS,
+    min_keep: float = NOPOOL_MIN_KEEP,
+    parity_skew: float = NOPOOL_PARITY_SKEW,
+    max_rows: int = NOPOOL_MAX_ROWS,
+) -> pd.DataFrame:
+    """
+    Compute historical stats for PAIRS drawn ONLY from today's applicable filters.
+    Fast, no simulated pools. Returns a dataframe with plain-English columns.
+    """
+    # Build envs for history days 1..idx_now-1 (each i uses seed=w[i-1], winner=w[i])
+    N = idx_now
+    if N < 2:
+        return pd.DataFrame()
+    envs = [build_env_for_draw(i, winners) for i in range(1, idx_now+1)]
+    # Today's applicable filter IDs
+    env_now = envs[-1]
+    todays_ids = [fid for fid, f in filters_all.items() if safe_eval(f.applicable_if, env_now)]
+    if len(todays_ids) < 2:
+        return pd.DataFrame()
+
+    # Compile expressions for just today's filters
+    f_slice = {fid: filters_all[fid] for fid in todays_ids}
+    comp_app = {}
+    comp_blk = {}
+    for fid, f in f_slice.items():
+        try:  comp_app[fid] = compile(f.applicable_if if f.applicable_if else "True", "<app_if>", "eval")
+        except Exception: comp_app[fid] = compile("False", "<app_if>", "eval")
+        try:  comp_blk[fid] = compile(f.expression if f.expression else "False", "<expr>", "eval")
+        except Exception: comp_blk[fid] = compile("False", "<expr>", "eval")
+
+    # Evaluate applicability/blocking per day for these filters
+    F = len(f_slice)
+    idx_map = {fid:i for i,fid in enumerate(todays_ids)}
+    app = np.zeros((N, F), dtype=bool)
+    blk = np.zeros((N, F), dtype=bool)
+    even_arr = np.zeros(N, dtype=int)
+
+    for i, env in enumerate(envs):
+        # winner parity
+        even_arr[i] = 1 if (sum(env["combo_digits_list"]) % 2 == 0) else 0
+        for fid in todays_ids:
+            j = idx_map[fid]
+            try:
+                a = bool(eval(comp_app[fid], {"__builtins__": {}}, env))
+            except Exception:
+                a = False
+            app[i, j] = a
+            if a:
+                try:
+                    b = bool(eval(comp_blk[fid], {"__builtins__": {}}, env))
+                except Exception:
+                    b = False
+                blk[i, j] = b
+
+    # Compute pair stats for these filters
+    recs = []
+    for a_idx in range(F):
+        for b_idx in range(a_idx+1, F):
+            mask = app[:, a_idx] & app[:, b_idx]
+            n = int(mask.sum())
+            if n == 0:
+                continue
+            either_blocks = int(((blk[:, a_idx] | blk[:, b_idx]) & mask).sum())
+            both_blocks  = int(((blk[:, a_idx] & blk[:, b_idx]) & mask).sum())
+            kept_rate = (1 - (either_blocks / n)) * 100.0
+            even_rate = float(even_arr[mask].mean() * 100.0)
+            # Only show parity if sufficiently skewed from 50/50
+            parity_note = ""
+            if abs(even_rate - 50.0) >= float(parity_skew):
+                tip = "EVEN" if even_rate >= 50.0 else "ODD"
+                parity_note = f"{tip} skew: {even_rate:.1f}%"
+            recs.append({
+                "Filter A ID": todays_ids[a_idx],
+                "Filter A Name": f_slice[todays_ids[a_idx]].name,
+                "Filter B ID": todays_ids[b_idx],
+                "Filter B Name": f_slice[todays_ids[b_idx]].name,
+                "Days both applicable (history)": n,
+                "Winner kept % (both applicable)": round(kept_rate, 3),
+                "Either blocks winner %": round((either_blocks/n)*100.0, 3),
+                "Both block winner %": round((both_blocks/n)*100.0, 3),
+                "Parity note (only if meaningful)": parity_note,
+            })
+    df = pd.DataFrame(recs)
+    if df.empty:
+        return df
+    df = df.sort_values(
+        ["Winner kept % (both applicable)", "Days both applicable (history)"],
+        ascending=[False, False]
+    )
+    # Keep only “viable” by thresholds; still write all to CSV for transparency
+    df_viable = df[(df["Days both applicable (history)"] >= int(min_days)) &
+                   (df["Winner kept % (both applicable)"] >= float(min_keep))].copy()
+    # Persist
+    df.to_csv(OUTPUT_DIR / "NoPool_today_pairs_ALL.csv", index=False)
+    df_viable.head(max_rows).to_csv(OUTPUT_DIR / "NoPool_today_pairs_TOP.csv", index=False)
+    return df_viable.head(max_rows)
+
+# =============================================================================
 # Public entry
 # =============================================================================
-
 def main(
     winners_csv: Optional[str] = None,
     filters_csv: Optional[str] = None,
@@ -377,7 +477,7 @@ def main(
     target_max: int = TARGET_MAX,
     always_keep_winner: bool = ALWAYS_KEEP_WINNER,
     minimize_beyond_target: bool = MINIMIZE_BEYOND_TARGET,
-    force_keep_combo: Optional[str] = None,   # <— used to pin a combo in-pool
+    force_keep_combo: Optional[str] = None,
     override_seed: Optional[str] = None,
     override_prev: Optional[str] = None,
     override_prevprev: Optional[str] = None,
@@ -386,6 +486,7 @@ def main(
     decay_half_life: Optional[int] = None,
     applicable_only: Optional[List[str]] = None,
     affinity_exclude_top_pct: Optional[float] = None,
+    include_nopool_panel: bool = INCLUDE_NOPOOL_PANEL,
 ):
 
     winners_path = winners_csv or WINNERS_CSV
@@ -399,16 +500,34 @@ def main(
 
     winners_df = pd.read_csv(winners_path)
     winners = load_winners(winners_path)
-    filters = load_filters(filters_path)
+    filters_list = load_filters(filters_path)
 
-    idx_now, applicable, env_now = today_applicable_filters(filters, winners)
+    # Build map id->filter
+    filters_map: Dict[str, FilterDef] = {f.fid: f for f in filters_list if f.enabled}
 
-    # Restrict to Applicable-Only (case-insensitive)
+    idx_now, applicable, env_now = today_applicable_filters(filters_list, winners)
+
+    # If caller wants to limit to a subset of filters
     if applicable_only:
-        allow = {str(fid).strip().upper() for fid in applicable_only}
-        applicable = {fid: f for fid, f in applicable.items() if fid.upper() in allow}
+        applicable_only = {fid.strip() for fid in applicable_only}
+        applicable = {fid: f for fid, f in applicable.items() if fid in applicable_only}
 
-    # Get today's pool
+    # Historical risk for ranking order
+    single_fail, pair_risk, idx_used = historical_risk_for_applicable(
+        list(applicable.values()), winners, idx_now,
+        max_draws=max_draws, max_bucket_matches=max_bucket_matches,
+        decay_half_life=decay_half_life
+    )
+    support = {fid: 0 for fid in applicable}
+    for i in idx_used:
+        env_i = build_env_for_draw(i, winners)
+        for fid, f in applicable.items():
+            if safe_eval(f.applicable_if, env_i):
+                support[fid] = support.get(fid, 0) + 1
+    ranked = sorted(applicable.values(),
+                    key=lambda f: (single_fail.get(f.fid, 1.0), -support.get(f.fid,0), f.fid))
+
+    # Load pool (today) or archived
     if today_pool_csv:
         df_pool = pd.read_csv(today_pool_csv)
         if "combo" not in df_pool.columns:
@@ -424,12 +543,7 @@ def main(
         pool = pool_df["combo"].astype(str).tolist()
 
     remaining = len(pool)
-
-    # Winner to preserve: either explicit force_keep_combo, or the true winner at idx_now
-    if force_keep_combo:
-        winner_today = str(force_keep_combo).strip().replace(" ", "").zfill(5)
-    else:
-        winner_today = winners[idx_now] if pool else None
+    winner_today = winners[idx_now] if pool else None
 
     seq_rows = []  # step log
 
@@ -472,20 +586,7 @@ def main(
                 "skipped_reason": None,
             })
 
-    # ===== Rank filters by historical failure (winner-preserving) =====
-    single_fail, pair_risk, idx_used = historical_risk_for_applicable(
-        list(applicable.values()), winners, idx_now
-    )
-    support = {fid: 0 for fid in applicable}
-    for i in idx_used:
-        env_i = build_env_for_draw(i, winners)
-        for fid, f in applicable.items():
-            if safe_eval(f.applicable_if, env_i):
-                support[fid] = support.get(fid, 0) + 1
-    ranked = sorted(applicable.values(),
-                    key=lambda f: (single_fail.get(f.fid, 1.0), -support.get(f.fid,0), f.fid))
-
-    # Pair conflicts (for "avoid pairs" table)
+    # ===== Pair conflicts (for "avoid pairs" table) =====
     avoid_rows = []
     for a, b in it.combinations(sorted(applicable.keys()), 2):
         pr = pair_risk.get((a,b)) or pair_risk.get((b,a)) or 0.0
@@ -525,8 +626,7 @@ def main(
 
         if final_pool is not None:
             new_pool, elim = apply_filter_to_pool(f, base_env, final_pool)
-            if always_keep_winner and winner_today and (winner_today in final_pool) and (winner_today not in new_pool):
-                # Skip if this step would remove the pinned/winner combo
+            if ALWAYS_KEEP_WINNER and (winner_today in final_pool) and (winner_today not in new_pool):
                 seq_rows.append({
                     "step": step, "filter_id": fid, "name": f.name,
                     "eliminated_now": 0, "remaining": remaining,
@@ -557,7 +657,7 @@ def main(
                 "skipped_reason": None
             })
 
-    # ===== Outputs =====
+    # ===== Outputs (sequence) =====
     seq_df = pd.DataFrame(seq_rows)
     seq_df.to_csv(OUTPUT_DIR / "recommender_sequence.csv", index=False)
     if final_pool is not None:
@@ -565,7 +665,7 @@ def main(
             OUTPUT_DIR / "pool_reduction_log.csv", index=False
         )
 
-    # Tier list (quick “do not apply” summary)
+    # ===== Tier list (quick “do not apply” summary) =====
     rows = []
     for fid, f in applicable.items():
         risk = float(single_fail.get(fid, 0.0))
@@ -584,10 +684,21 @@ def main(
         )
         do_not_df.to_csv(OUTPUT_DIR / "do_not_apply.csv", index=False)
 
-    # One-pager (HTML)
+    # ===== NoPool panel (today’s historically safe pairs) =====
+    nopool_df = pd.DataFrame()
+    if include_nopool_panel:
+        nopool_df = nopool_today_pairs(
+            winners, filters_map, idx_now,
+            min_days=NOPOOL_MIN_DAYS,
+            min_keep=NOPOOL_MIN_KEEP,
+            parity_skew=NOPOOL_PARITY_SKEW,
+            max_rows=NOPOOL_MAX_ROWS,
+        )
+
+    # ===== One-pager (HTML) =====
     seed_list = base_env['seed_digits_list']
     parity_major = "even>=3" if sum(1 for d in seed_list if d%2==0) >= 3 else "even<=2"
-    winner_kept = (winner_today in (final_pool or [])) if (final_pool is not None) else True
+    winner_kept = (winner_today in (final_pool or [])) if pool else True
 
     HTML_CSS = """<!doctype html><html lang='en'><head><meta charset='utf-8'>
 <title>DC5 Recommender — One-Pager</title>
@@ -605,6 +716,7 @@ h2 { font-size: 18px; margin: 24px 0 8px; }
 .badge { display:inline-block; padding:6px 10px; border-radius:12px; background:#eef2ff; margin-right:8px; }
 .badge.ok { background:#ecfdf5; }
 .badge.bad { background:#fef2f2; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
 </style></head><body><div class='wrap'>"""
 
     applied = seq_df[seq_df["eliminated_now"].notna() & (seq_df["eliminated_now"]>0)]
@@ -627,46 +739,57 @@ h2 { font-size: 18px; margin: 24px 0 8px; }
         base_env['seed_sum'], html.escape(base_env['seed_sum_category']),
         html.escape(classify_structure(seed_list)),
         base_env['spread_seed'], parity_major,
-        int(round((affinity_exclude_top_pct or 0)*100)),
+        int(round((AFFINITY_EXCLUDE_TOP_PCT if affinity_exclude_top_pct is None else affinity_exclude_top_pct)*100)),
         len(applicable),
         "ok" if winner_kept else "bad", "Winner: " + ("KEPT" if winner_kept else "REMOVED"),
-        target_max+1,
+        TARGET_MAX+1,
         remaining if remaining is not None else "—"
     )
 
     def df_to_html_table(df: pd.DataFrame, columns: list, empty_msg: str, limit: int = None):
         if df is None or df.empty:
-            return "<p class='muted'>{}</p>".format(html.escape(empty_msg))
+            return "<p class='muted mono'>{}</p>".format(html.escape(empty_msg))
         use = df[columns].copy()
         if limit: use = use.head(limit)
         return use.to_html(index=False, classes="table", border=0, escape=True)
+
+    avoid_path = OUTPUT_DIR / "avoid_pairs.csv"
+    avoid_df = pd.read_csv(avoid_path) if avoid_path.exists() else pd.DataFrame()
+    avoid_sorted = avoid_df.sort_values(["pair_risk","co_applicable_n"], ascending=[False,False]) if not avoid_df.empty else avoid_df
 
     applied_html = df_to_html_table(applied, ["step","filter_id","name","eliminated_now","remaining"],
                                     "No safe reduction steps.", 60)
     skipped_html = df_to_html_table(skipped, ["filter_id","name","skipped_reason"],
                                     "No steps were skipped.", 60)
-    avoid_path = OUTPUT_DIR / "avoid_pairs.csv"
-    avoid_df = pd.read_csv(avoid_path) if avoid_path.exists() else pd.DataFrame()
-    avoid_sorted = avoid_df.sort_values(["pair_risk","co_applicable_n"], ascending=[False,False]) if not avoid_df.empty else avoid_df
-    avoid_html = df_to_html_table(avoid_sorted,
-                                  ["filter_id_1","filter_id_2","pair_risk","both_blocked_n","co_applicable_n"],
-                                  "No high-risk pairs in this bucket.", 20)
+    avoid_html   = df_to_html_table(avoid_sorted,
+                                    ["filter_id_1","filter_id_2","pair_risk","both_blocked_n","co_applicable_n"],
+                                    "No high-risk pairs in this bucket.", 20)
+
+    # NoPool panel
+    nopool_html = ""
+    if include_nopool_panel:
+        nopool_cols = ["Filter A ID","Filter B ID","Days both applicable (history)",
+                       "Winner kept % (both applicable)","Either blocks winner %","Both block winner %",
+                       "Parity note (only if meaningful)"]
+        nopool_html = df_to_html_table(nopool_df, nopool_cols,
+                                       f"No historical pairs meet thresholds (min_days={NOPOOL_MIN_DAYS}, min_keep={NOPOOL_MIN_KEEP}%).",
+                                       NOPOOL_MAX_ROWS)
 
     html_doc = HTML_CSS + snap + \
         "<div class='card'><h2>Apply in this order (winner-preserving)</h2>{}</div>".format(applied_html) + \
         "<div class='card'><h2>Skipped steps</h2>{}</div>".format(skipped_html) + \
         "<div class='card'><h2>Avoid combining (today’s bucket)</h2>{}</div>".format(avoid_html) + \
+        (("<div class='card'><h2>Today — historically safe filter pairs (NoPool)</h2>{}</div>".format(nopool_html)) if include_nopool_panel else "") + \
         "</div></body></html>"
 
     (OUTPUT_DIR / "one_pager.html").write_text(html_doc, encoding="utf-8")
-
     return seq_rows
 
 __all__ = [
     "WINNERS_CSV","FILTERS_CSV","TODAY_POOL_CSV","OUTPUT_DIR",
     "TARGET_MAX","ALWAYS_KEEP_WINNER","MINIMIZE_BEYOND_TARGET",
     "AFFINITY_EXCLUDE_TOP_PCT",
-    "main","combo_affinity","get_pool_for_seed"
+    "main","combo_affinity","get_pool_for_seed","nopool_today_pairs"
 ]
 
 if __name__ == "__main__":
